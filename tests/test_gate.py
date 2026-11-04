@@ -512,3 +512,18 @@ def test_i15_carry_out_naming_a_mapping_whose_source_is_another(tmp_path, clock)
     why = model.execution_check(g.state, model.Guidance(NAV, "rudder", 5, "n1", 99, clock(), execution="carry_out",
                                                         mapping_id="m-rudder"), clock())
     assert "execution source is navigation/1" in why
+
+
+def test_a_refused_guidance_sample_is_still_what_the_source_says_for_neutral_or_match(tmp_path, clock):
+    """Carry-out needs a fresh sample from the navigator at PREPARE, before its mapping exists."""
+    g = make(tmp_path, clock)
+    clear(g)
+    lease(g)
+    g.observe_navigation(1, {"track_keeping": (NAV_PRINCIPAL, 4)})
+    for i, d in enumerate(DOFS):
+        ok, _ = g.guidance(model.Guidance(NAV, d, 0, "n1", i + 1, clock(), decision="nav_function", function="track_keeping",
+                                          nav_revision=1, execution="carry_out", mapping_id=f"m-{d}"))
+        assert not ok  # no mapping yet: refused to act on
+    nav_rows = tuple(Mapping(d, TED, TOKEN, NAV, (), "", f"m-{d}") for d in DOFS)
+    ack = g.prepare(Proposal("t1", model.GRANT, nav_rows, "ROC-1", 2000, TED))
+    assert ack.accepted, ack.reason

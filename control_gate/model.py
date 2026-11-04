@@ -500,9 +500,13 @@ def on_guidance(st: State, pol: Policy, g: Guidance, now_ms: int) -> tuple[State
         why = execution_check(st, g, now_ms)
     sample = Sample(g.source, g.dof, g.value_pct, g.stream_id, g.sequence, g.recv_ms)
     if why:
+        # Refused to ACT on, but still what the source says now: neutral-or-match (prepare) reads it.
+        # Without this, a carry-out mapping could never be committed -- prepare needs a fresh sample
+        # from the incoming source, and that source's samples are refused until the mapping exists.
         known = st.streams.get(g.source)
         if known is None or known.stream_id != g.stream_id or g.sequence > known.last_sequence:
-            st = replace(st, streams={**st.streams, g.source: Stream(g.stream_id, g.sequence)})
+            st = replace(st, streams={**st.streams, g.source: Stream(g.stream_id, g.sequence)},
+                         latest={**st.latest, (g.source, g.dof): sample})
         return st, False, why
     return on_sample(st, pol, sample, now_ms)
 
