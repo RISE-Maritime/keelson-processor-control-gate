@@ -1,0 +1,15 @@
+# The onboard motion gate: ONE per vessel, its own process from day one, even beside the connector.
+# The store on a persistent volume; the policy is the control matrix and safe_state_policy timings.
+services:
+  control-gate:
+    image: ghcr.io/rise-maritime/keelson-processor-control-gate:latest
+    container_name: control-gate
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - gate-state:/state
+      - ./config/policy.json:/config/policy.json:ro
+    command: "control-gate2keelson --log-level 20 -r rise -e <vessel_id> --state-dir /state --policy /config/policy.json"
+
+volumes:
+  gate-state:

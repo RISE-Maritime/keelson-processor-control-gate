@@ -1,0 +1,392 @@
+"""The gate's decisions and its sequence: the fence, the reservation, the per-DOF test, the
+transition state, the direct abort. No network."""
+
+import sqlite3
+
+import pytest
+
+from control_gate import model
+from control_gate.actuation import LoggingActuator
+from control_gate.model import DirectAbort, Fence, Mapping, Proposal, Sample
+from control_gate.policy import parse
+from control_gate.service import Gate
+from control_gate.store import Store
+
+V = "usv-alpha"
+DOFS = ["rudder", "throttle"]
+POL = parse({"dofs": DOFS, "automation_sources": ["navigation/0"], "transition": {"values": {"throttle": 0}}})
+TED, TOKEN = "ted@ROC-1", "tok-ted"
+
+
+class Clock:
+    def __init__(self):
+        self.t = 10_000
+
+    def __call__(self):
+        return self.t
+
+
+@pytest.fixture
+def clock():
+    return Clock()
+
+
+def make(tmp_path, clock, policy=POL):
+    g = Gate(store=Store(tmp_path / "gate.sqlite"), policy=policy, vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
+    g.boot()
+    return g
+
+
+def rows(station="ROC-1", holder=TED, lease=TOKEN, envelope=()):
+    return tuple(Mapping(d, holder, lease, f"{station}/helm-1/{d}", envelope, "", f"m-{d}") for d in DOFS)
+
+
+class Helm:
+    """A station's helm publishing candidate samples, one stream, rising sequence."""
+
+    def __init__(self, gate, clock, station="ROC-1", stream="s1"):
+        self.g, self.clock, self.station, self.stream = gate, clock, station, stream
+        # One sequence per (gate, stream), so two Helm objects on one stream keep rising.
+        self.seqs = gate.__dict__.setdefault("_test_seqs", {})
+
+    def put(self, dof, value, fence=None, seq=None, stream=None, source=None):
+        stream = stream or self.stream
+        source = source or f"{self.station}/helm-1/{dof}"
+        key = (source, stream)
+        self.seqs[key] = seq if seq is not None else self.seqs.get(key, 0) + 1
+        return self.g.sample(Sample(source, dof, value, stream, self.seqs[key], self.clock(), fence))
+
+    def all(self, value=0.0):
+        for d in DOFS:
+            self.put(d, value)
+
+
+def clear(g):
+    g.observe_safety(model.SAFETY_CLEAR, False)
+
+
+def lease(g, holder=TED, token=TOKEN, ttl=2000):
+    g.observe_lease("conn", holder, token, ttl, False)
+
+
+def take(g, clock, station="ROC-1", kind=model.GRANT, tid="t1", **kw):
+    """PREPARE → ACK → COMMIT, as the manager does it."""
+    ack = g.prepare(Proposal(tid, kind, rows(station, **kw) if kind != model.ABORT_AUTOMATION else (), station, 2000, TED))
+    if not ack.accepted:
+        return ack, False
+    applied, _, _ = g.commit(tid, ack.fence)
+    return ack, applied
+
+
+def ready(tmp_path, clock):
+    g = make(tmp_path, clock)
+    clear(g)
+    lease(g)
+    Helm(g, clock).all(0)
+    ack, applied = take(g, clock)
+    assert ack.accepted and applied
+    return g
+
+
+# ---------------------------------------------------------------------------- the fence (I2, I13)
+
+
+def test_a_fresh_gate_draws_a_term_and_starts_in_its_transition_state(tmp_path, clock):
+    g = make(tmp_path, clock)
+    assert len(g.state.term) == 32 and g.state.generation == 1 and g.state.in_transition
+    rows_ = g.cycle()
+    assert all(r.control_state == model.INHIBITED and r.value is None for r in rows_)  # no safety_state heard yet
+
+
+def test_the_ack_reserves_n_plus_1_and_only_the_commit_activates_it(tmp_path, clock):
+    g = make(tmp_path, clock)
+    clear(g)
+    lease(g)
+    Helm(g, clock).all(0)
+    ack = g.prepare(Proposal("t1", model.GRANT, rows(), "ROC-1", 2000, TED))
+    assert ack.accepted and ack.fence == Fence(g.state.term, 2)
+    assert g.state.generation == 1 and g.state.mappings == ()  # nothing changed on the ACK
+    applied, _, fence = g.commit("t1", ack.fence)
+    assert applied and fence.generation == 2 and g.state.station == "ROC-1"
+    assert all(m.fence == fence for m in g.state.mappings)
+
+
+def test_a_proposal_that_names_a_fence_is_refused(tmp_path, clock):
+    g = make(tmp_path, clock)
+    Helm(g, clock).all(0)
+    forged = tuple(Mapping(m.dof, m.authority_holder, m.authority_lease_id, m.execution_source, fence=Fence("ff" * 16, 9))
+                   for m in rows())
+    ack = g.prepare(Proposal("t1", model.GRANT, forged, "ROC-1", 2000))
+    assert not ack.accepted and "names no fence" in ack.reason
+
+
+def test_an_orphaned_prepare_lapses_on_the_gates_clock(tmp_path, clock):
+    g = make(tmp_path, clock)
+    Helm(g, clock).all(0)
+    ack = g.prepare(Proposal("t1", model.GRANT, rows(), "ROC-1", 2000))
+    assert not g.prepare(Proposal("t2", model.GRANT, rows(), "ROC-1", 2000)).accepted  # one at a time
+    clock.t += 2001
+    Helm(g, clock, stream="s1").all(0)
+    applied, reason, _ = g.commit("t1", ack.fence)
+    assert not applied and "no such reservation" in reason
+    assert g.prepare(Proposal("t2", model.GRANT, rows(), "ROC-1", 2000)).accepted
+
+
+def test_a_commit_after_a_gate_restart_is_refused_and_the_old_authority_stands(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    before = g.state.fence
+    Helm(g, clock, stream="s2").all(0)
+    ack = g.prepare(Proposal("t2", model.GRANT, rows(holder="anna@ROC-1", lease="tok-anna"), "ROC-1", 2000))
+    assert ack.accepted
+    g.store.close()
+    g2 = make(tmp_path, clock)  # restarted after its ACK: the reservation is gone
+    applied, _, fence = g2.commit("t2", ack.fence)
+    assert not applied and fence == before and g2.state.mappings[0].authority_holder == TED
+
+
+def test_the_fence_survives_a_restart_and_a_wiped_store_is_a_new_term(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    fence = g.state.fence
+    g.store.close()
+    g2 = make(tmp_path, clock)
+    assert g2.state.fence == fence and not g2.state.in_transition
+    g2.store.close()
+    db = sqlite3.connect(tmp_path / "gate.sqlite")
+    db.execute("UPDATE meta SET v=replace(v, '\"generation\":2', '\"generation\":7') WHERE k='state'")
+    db.commit()
+    db.close()
+    g3 = make(tmp_path, clock)
+    assert g3.state.term != fence.term and g3.state.generation == 1 and g3.state.in_transition
+    assert any("reinitialised" in e for e in g3.events)
+
+
+# ---------------------------------------------------------------------------- neutral-or-match (I10)
+
+
+def test_one_unmatched_lever_naks_the_whole_transfer(tmp_path, clock):
+    g = make(tmp_path, clock)
+    h = Helm(g, clock)
+    h.put("rudder", 0)
+    h.put("throttle", 80)  # 80 % ahead while the gate emits 0
+    ack = g.prepare(Proposal("t1", model.GRANT, rows(), "ROC-1", 2000))
+    assert not ack.accepted and ack.rejected_mapping_ids == ("m-throttle",) and g.state.reservation is None
+
+
+def test_a_matched_lever_picks_up(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    h = Helm(g, clock)
+    h.put("throttle", 40)
+    g.cycle()
+    assert g.state.emitting["throttle"] == 40
+    # Another station's lever at 42 % against 40 % emitted: within the band, so it may pick up.
+    h2 = Helm(g, clock, station="ROC-1", stream="s9")
+    h2.put("rudder", 0, source="ROC-1/helm-2/rudder")
+    h2.put("throttle", 0, source="ROC-1/helm-2/throttle")  # a new stream starts at neutral (I11)...
+    h2.put("throttle", 42, source="ROC-1/helm-2/throttle")  # ...then moves to match
+    ack = g.prepare(Proposal("t2", model.GRANT, tuple(Mapping(d, "anna@ROC-1", "tok-anna", f"ROC-1/helm-2/{d}", (), "", d)
+                                                     for d in DOFS), "ROC-1", 2000))
+    assert ack.accepted, ack.reason
+
+
+def test_a_silent_incoming_source_is_not_ready(tmp_path, clock):
+    g = make(tmp_path, clock)
+    ack = g.prepare(Proposal("t1", model.GRANT, rows(), "ROC-1", 2000))
+    assert not ack.accepted and "no fresh sample" in ack.reason
+
+
+def test_a_transfer_moves_every_dof_and_human_sources_sit_at_the_station(tmp_path, clock):
+    g = make(tmp_path, clock)
+    Helm(g, clock).all(0)
+    assert not g.prepare(Proposal("t1", model.GRANT, rows()[:1], "ROC-1", 2000)).accepted
+    assert not g.prepare(Proposal("t1", model.GRANT, rows("ROC-1"), "ROC-2", 2000)).accepted
+
+
+# ---------------------------------------------------------------------------- the per-DOF test
+
+
+def test_the_mapped_source_steers(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    assert Helm(g, clock).put("rudder", 20)[0]
+    out = {r.dof: r for r in g.cycle()}
+    assert out["rudder"].value == 20 and out["rudder"].control_state == model.ACTIVE
+    # Its zero from ready() was heard before the commit: a commit forgets every sample accepted under
+    # the old authority, so a mapped source that has not spoken since is silent.
+    assert out["throttle"].control_state == model.STALE and out["throttle"].value == 0
+
+
+@pytest.mark.parametrize("case", ["other_source", "stale_fence", "envelope", "lease_lapsed", "not_clear", "lockout"])
+def test_every_line_of_the_test_refuses_on_its_own(tmp_path, clock, case):
+    g = ready(tmp_path, clock)
+    h = Helm(g, clock)
+    if case == "other_source":
+        ok, why = h.put("rudder", 10, source="ROC-1/helm-2/rudder", stream="x")
+    elif case == "stale_fence":
+        ok, why = h.put("rudder", 10, fence=Fence(g.state.term, g.state.generation - 1))
+    elif case == "envelope":
+        g.state = model.replace(g.state, mappings=tuple(model.replace(m, envelope=(-30.0, 30.0, 0.0)) for m in g.state.mappings))
+        ok, why = h.put("rudder", 35)
+    elif case == "lease_lapsed":
+        clock.t += 2001
+        ok, why = h.put("rudder", 10)
+    elif case == "not_clear":
+        g.observe_safety(2, False)
+        ok, why = h.put("rudder", 10)
+    else:
+        g.observe_safety(model.SAFETY_CLEAR, True)
+        ok, why = h.put("rudder", 10)
+    assert not ok and why
+
+
+def test_the_rate_limit(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    g.state = model.replace(g.state, mappings=tuple(model.replace(m, envelope=(-100.0, 100.0, 20.0)) for m in g.state.mappings))
+    h = Helm(g, clock)
+    assert h.put("rudder", 0)[0]
+    clock.t += 100
+    assert not h.put("rudder", 10)[0]  # 100 %/s
+    clock.t += 400
+    assert h.put("rudder", 9)[0]  # 18 %/s over the half second since the last accepted
+
+
+def test_a_sample_accepted_under_the_old_holder_does_not_drive_under_the_new_one(tmp_path, clock):
+    """A grant on the same helm: what ted's lever said is not anna's order, even for the 1 s it is fresh."""
+    g = ready(tmp_path, clock)
+    h = Helm(g, clock)
+    assert h.put("rudder", 20)[0]
+    g.cycle()
+    h.put("rudder", 20)
+    h.put("throttle", 0)
+    lease(g, "anna@ROC-1", "tok-anna")
+    ack, applied = take(g, clock, tid="t2", holder="anna@ROC-1", lease="tok-anna")
+    assert applied
+    out = {r.dof: r for r in g.cycle()}
+    assert out["rudder"].control_state == model.STALE and out["rudder"].value == 0
+
+
+def test_ordering_is_per_stream_and_a_fresh_late_sample_is_dropped(tmp_path, clock):
+    """I11: seq 102 over the satellite link arrives first; 101 over LTE, though fresh, is dropped."""
+    g = ready(tmp_path, clock)
+    h = Helm(g, clock)
+    assert h.put("rudder", 12, seq=102)[0]
+    ok, why = h.put("rudder", 10, seq=101)
+    assert not ok and "out of order" in why
+
+
+def test_a_helm_restarting_at_80_percent_cannot_regain_motion(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    h = Helm(g, clock)
+    h.put("throttle", 0)
+    ok, why = h.put("throttle", 80, stream="restarted", seq=1)
+    assert not ok and "neutral-reconnect" in why
+    assert h.put("throttle", 0, stream="restarted", seq=2)[0]  # back to neutral: the new stream is taken
+    assert h.put("throttle", 30, stream="restarted", seq=3)[0]
+
+
+def test_a_silent_source_resolves_to_the_transition_value_not_its_last_word(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    Helm(g, clock).put("throttle", 60)
+    clock.t += POL.max_axis_age_ms + 1
+    lease(g)  # the holder is still here; only the lever went quiet
+    out = {r.dof: r for r in g.cycle()}
+    assert out["throttle"].value == 0 and out["throttle"].control_state == model.STALE
+
+
+def test_under_a_stop_or_the_lockout_the_gate_emits_nothing(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    Helm(g, clock).put("throttle", 30)
+    g.observe_safety(2, False)  # STOPPED
+    assert all(r.value is None and r.control_state == model.INHIBITED for r in g.cycle())
+    g.observe_safety(model.SAFETY_CLEAR, True)
+    assert all(r.value is None for r in g.cycle())
+
+
+def test_a_silent_supervisor_is_not_a_clear_one(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    clock.t += POL.safety_ttl_ms + 1
+    lease(g)
+    assert all(r.control_state == model.INHIBITED for r in g.cycle())
+
+
+# ---------------------------------------------------------------------------- the gate alone (I2, I9)
+
+
+def test_the_holders_lease_lapses_and_the_gate_fences_alone(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    n = g.state.generation
+    clock.t += 2001
+    clear(g)
+    out = g.cycle()
+    assert g.state.generation == n + 1 and g.state.in_transition and g.state.mappings == ()
+    assert all(r.control_state == model.TRANSITION and r.value == 0 for r in out)
+    assert any("fenced alone" in e for e in g.events)
+    g.store.close()
+    assert make(tmp_path, clock).state.generation == n + 1  # persisted before it emitted
+
+
+def test_navigation_executes_under_a_humans_conn_and_the_humans_lease_is_what_counts(tmp_path, clock):
+    """I9: the holder is not the source. navigation/0 holds no lease; when the human's lapses, the DOF
+    withdraws though the navigator is perfectly fresh."""
+    g = make(tmp_path, clock)
+    clear(g)
+    lease(g)
+    nav = [Mapping(d, TED, TOKEN, "navigation/0", (), "", d) for d in DOFS]
+    for d in DOFS:
+        g.sample(Sample("navigation/0", d, 0, "n1", DOFS.index(d) + 1, clock()))
+    ack = g.prepare(Proposal("t1", model.GRANT, tuple(nav), "ROC-1", 2000))
+    assert ack.accepted and g.commit("t1", ack.fence)[0]
+    assert g.sample(Sample("navigation/0", "rudder", 5, "n1", 10, clock()))[0]
+    clock.t += 2001
+    clear(g)
+    g.sample(Sample("navigation/0", "rudder", 5, "n1", 11, clock()))
+    g.cycle()
+    assert g.state.in_transition
+
+
+def test_no_lease_heard_yet_after_a_restart_is_not_a_lapse_within_the_grace(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    n = g.state.generation
+    g.store.close()
+    g2 = make(tmp_path, clock)
+    clear(g2)
+    g2.cycle()
+    assert g2.state.generation == n  # within the grace: not fenced, and nothing actuates (no lease heard)
+    assert not Helm(g2, clock, stream="s5").put("rudder", 0)[0]
+    clock.t += POL.lease_grace_ms + 1
+    clear(g2)
+    g2.cycle()
+    assert g2.state.generation == n + 1
+
+
+def test_abort_through_the_manager_proposes_no_map_and_enters_the_transition_state(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    ack, applied = take(g, clock, kind=model.ABORT_AUTOMATION, tid="a1")
+    assert applied and g.state.in_transition and g.state.mappings == ()
+    assert "abort automation" in g.state.transition_reason
+
+
+# ---------------------------------------------------------------------------- the direct abort
+
+
+def _projection(g, clock, feed_ttl=15000):
+    g.observe_assignments(None, model.AssignmentSeen("anna@ROC-2", "as-7", 4), "authority-manager/0", feed_ttl)
+    g.observe_session(model.NAVIGATIONAL, "anna@ROC-2", "sess-a", "as-7", 30000, False)
+
+
+def test_the_direct_abort_verifies_on_its_own_projection(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    _projection(g, clock)
+    n = g.state.generation
+    assert not g.abort_direct(DirectAbort("bo@ROC-2", "as-7", 4, "sess-a"))[0]
+    assert not g.abort_direct(DirectAbort("anna@ROC-2", "as-7", 3, "sess-a"))[0]  # stale revision
+    assert not g.abort_direct(DirectAbort("anna@ROC-2", "as-7", 4, "wrong"))[0]
+    ok, _, fence = g.abort_direct(DirectAbort("anna@ROC-2", "as-7", 4, "sess-a", "no answer from the navigator"))
+    assert ok and fence.generation == n + 1 and g.state.in_transition
+
+
+def test_with_the_manager_alive_a_lapsed_session_is_refused_with_it_dead_the_last_one_counts(tmp_path, clock):
+    g = ready(tmp_path, clock)
+    _projection(g, clock, feed_ttl=60000)
+    clock.t += 30001  # the session lapsed; the feed (60 s) is still live
+    assert not g.abort_direct(DirectAbort("anna@ROC-2", "as-7", 4, "sess-a"))[0]
+    clock.t += 30000  # now the feed is stale too: the manager is gone
+    assert g.abort_direct(DirectAbort("anna@ROC-2", "as-7", 4, "sess-a"))[0]

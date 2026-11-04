@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install
+        run: uv sync --locked --extra dev --python 3.13
+      - name: Lint
+        run: uv run --locked ruff check .
+      - name: Unit tests
+        run: uv run --locked pytest -vv -m "not e2e"
+      # Loopback only, multicast scouting off: the e2e never reaches another network.
+      - name: End-to-end tests
+        run: uv run --locked pytest -vv -m e2e
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t keelson-processor-control-gate .
+      - name: Smoke test the entry point
+        run: docker run --rm keelson-processor-control-gate "control-gate2keelson --help"

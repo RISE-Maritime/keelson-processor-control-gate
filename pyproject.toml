@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keelson-processor-control-gate"
+version = "0.1.0"
+description = "The onboard motion gate: the enforcer between every candidate source and the actuators, owner of the motion fence (keelson command_authority, control_gate/v1)."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    # EXACT pin, never a path or a range. The types span keelson #331 (fences, mappings), #332
+    # (SafetyState), #358 (constraints) and #359 (control_gate/v1): an experimental build carries
+    # them all, tracked by crowsnest-dev #85.
+    # PENDING: the build has not been cut yet; until it is, develop against a local merge of those
+    # branches (README, "Developing before the build").
+    "keelson==0.6.0.dev21",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.4", "ruff==0.14.11"]
+
+[tool.setuptools]
+packages = ["control_gate"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["e2e: end-to-end test that runs the CLI on an isolated loopback Zenoh peer"]
+
+[tool.ruff]
+line-length = 140
