@@ -390,3 +390,125 @@ def test_with_the_manager_alive_a_lapsed_session_is_refused_with_it_dead_the_las
     assert not g.abort_direct(DirectAbort("anna@ROC-2", "as-7", 4, "sess-a"))[0]
     clock.t += 30000  # now the feed is stale too: the manager is gone
     assert g.abort_direct(DirectAbort("anna@ROC-2", "as-7", 4, "sess-a"))[0]
+
+
+# ---------------------------------------------------------------------------- guidance: DECISION ∧ EXECUTION (I15)
+
+NAV = "navigation/0"
+NAV_PRINCIPAL = "navigation/0@usv-alpha"
+
+
+def _carry_out(tmp_path, clock, functions=None, revision=7):
+    """A human holds the conn; navigation/0 carries out under it on every DOF (the mapping's source)."""
+    g = make(tmp_path, clock)
+    clear(g)
+    lease(g)
+    nav_rows = tuple(Mapping(d, TED, TOKEN, NAV, (), "", f"m-{d}") for d in DOFS)
+    for i, d in enumerate(DOFS):
+        g.sample(Sample(NAV, d, 0, "n1", i + 1, clock()))
+    ack = g.prepare(Proposal("t1", model.GRANT, nav_rows, "ROC-1", 2000, TED))
+    assert ack.accepted, ack.reason
+    g.commit("t1", ack.fence)
+    g.observe_navigation(revision, functions if functions is not None else {"track_keeping": (NAV_PRINCIPAL, 4)})
+    g._seq = 10
+    return g
+
+
+def _guide(g, clock, **kw):
+    g._seq += 1
+    base = dict(source=NAV, dof="rudder", value_pct=5.0, stream_id="n1", sequence=g._seq, recv_ms=clock(),
+                decision="nav_function", function="track_keeping", nav_revision=7, execution="carry_out", mapping_id="m-rudder")
+    base.update(kw)
+    return g.guidance(model.Guidance(**base))
+
+
+def test_i15_a_function_it_does_not_hold_is_refused_though_execution_passes(tmp_path, clock):
+    g = _carry_out(tmp_path, clock)
+    ok, why = _guide(g, clock, function="collision_avoidance")
+    assert not ok and "does not hold collision_avoidance" in why
+    assert model.execution_check(g.state, model.Guidance(NAV, "rudder", 5, "n1", 99, clock(), execution="carry_out",
+                                                         mapping_id="m-rudder"), clock()) == ""  # EXECUTION alone passes
+    ok, why = _guide(g, clock)  # the function it holds, at method 4
+    assert ok, why
+
+
+def test_i15_each_decision_refusal_on_its_own(tmp_path, clock):
+    g = _carry_out(tmp_path, clock, functions={"track_keeping": (NAV_PRINCIPAL, 2)})
+    assert "below DELEGATED" in _guide(g, clock)[1]
+    g = _carry_out(tmp_path / "b", clock)
+    assert "revision" in _guide(g, clock, nav_revision=6)[1]
+    assert "HUMAN_ORDER cannot be verified" in _guide(g, clock, decision="human_order", order_id="o-1")[1]
+    assert "no decision basis" in _guide(g, clock, decision="")[1]
+    g2 = make(tmp_path / "c", clock)
+    assert "no navigation authority document" in model.decision_check(g2.state, model.Guidance(
+        NAV, "rudder", 0, "n", 1, 0, decision="nav_function", function="track_keeping", nav_revision=1))
+
+
+def test_i15_each_execution_refusal_on_its_own(tmp_path, clock):
+    g = _carry_out(tmp_path, clock)
+    assert "not this DOF's" in _guide(g, clock, mapping_id="m-throttle")[1]
+    assert "does not hold the conn" in _guide(g, clock, execution="direct")[1]  # a human holds it
+    assert "no execution basis" in _guide(g, clock, execution="")[1]
+    # A helm source claiming the navigator's mapping is not its execution source.
+    ok, why = g.guidance(model.Guidance("ROC-1/helm-1/rudder", "rudder", 5, "h", 1, clock(), decision="nav_function",
+                                        function="track_keeping", nav_revision=7, execution="carry_out", mapping_id="m-rudder"))
+    assert not ok
+
+
+def test_direct_execution_under_full_automation(tmp_path, clock):
+    g = _carry_out(tmp_path, clock)
+    lease(g, NAV_PRINCIPAL, TOKEN)  # the navigator itself holds the conn now (same lease token)
+    g.state = model.replace(g.state, mappings=tuple(model.replace(m, authority_holder=NAV_PRINCIPAL) for m in g.state.mappings))
+    ok, why = _guide(g, clock, execution="direct")
+    assert ok, why
+
+
+def test_a_refused_guidance_sample_still_counts_for_ordering(tmp_path, clock):
+    g = _carry_out(tmp_path, clock)
+    _guide(g, clock, function="collision_avoidance", sequence=50)
+    ok, why = _guide(g, clock, sequence=49)  # older than the refused one: dropped as out of order
+    assert not ok and "out of order" in why
+
+
+# ---------------------------------------------------------------------------- ResolvedControl
+
+
+def test_the_cycle_record_carries_what_resolved_control_needs(tmp_path, clock):
+    pol = parse({"dofs": DOFS, "groups": {"helm": ["rudder", "throttle"]}})
+    g = make(tmp_path, clock, policy=pol)
+    clear(g)
+    lease(g)
+    Helm(g, clock).all(0)
+    take(g, clock)
+    Helm(g, clock).put("rudder", 12)
+    g.cycle()
+    c1 = g.last_cycle
+    g.cycle()
+    c2 = g.last_cycle
+    assert (c1.sequence, c2.sequence) == (1, 2) and c2.groups == (("helm", 2),)
+    assert c2.actuation_allowed and not c2.in_transition and c2.fence == g.state.fence
+    from control_gate import codec
+
+    rc = codec.resolved_control(c2, V, "control-gate")
+    rudder = next(d for d in rc.dofs if d.dof == "rudder")
+    assert rudder.accepted_pct == 12 and rudder.control_state == 1 and rudder.feedback_quality == 4  # ACTIVE, NONE
+    g.observe_safety(2, False)  # STOPPED: emits nothing
+    g.cycle()
+    stopped = codec.resolved_control(g.last_cycle, V, "control-gate")
+    assert all(not d.HasField("accepted_pct") and d.control_state == 4 for d in stopped.dofs)
+    assert not stopped.actuation_allowed
+
+
+def test_i15_the_function_held_by_someone_else_is_not_this_sources(tmp_path, clock):
+    g = _carry_out(tmp_path, clock, functions={"track_keeping": ("anna@ROC-2", 4)})
+    ok, why = _guide(g, clock)
+    assert not ok and "does not hold track_keeping" in why
+
+
+def test_i15_carry_out_naming_a_mapping_whose_source_is_another(tmp_path, clock):
+    """EXECUTION on its own: the right mapping id, but that mapping executes someone else."""
+    g = _carry_out(tmp_path, clock)
+    g.state = model.replace(g.state, mappings=tuple(model.replace(m, execution_source="navigation/1") for m in g.state.mappings))
+    why = model.execution_check(g.state, model.Guidance(NAV, "rudder", 5, "n1", 99, clock(), execution="carry_out",
+                                                        mapping_id="m-rudder"), clock())
+    assert "execution source is navigation/1" in why

@@ -11,9 +11,12 @@ sample has to pass the gate's own test before it reaches actuation.
   crowsnest-dev #85.
 - **Its caller:** `keelson-processor-control-authority`, the onboard authority manager.
 
-> **Status: the core. It actuates nothing.** It resolves to a logging actuator only. No candidate
-> subject exists yet, so no sample reaches it over the bus, and nothing consumes `ResolvedControl`.
-> Never run this against a real vessel or a shared network.
+> **Status: it gates over the bus, and actuates nothing.**
+> - It hears its candidates (`control_candidate`, `guidance_candidate`) and publishes
+>   `resolved_control` every cycle.
+> - Its own actuator still only logs. A downstream connector consuming `resolved_control` is its
+>   own change.
+> - Never run this against a real vessel or a shared network.
 
 ## What it does
 
@@ -49,6 +52,24 @@ sample has to pass the gate's own test before it reaches actuation.
   - **With the manager dead, the last session heard counts.** Sessions are renewed through the
     manager, so they lapse with it. The abort only ever makes the vessel more inhibited.
   - **Not a back door:** it fences the automation, proposes no map and grants nothing.
+- **A guidance candidate is checked twice, independently (I15).** The navigator's
+  `GuidanceCandidate` must pass both:
+  - **DECISION:** under NAV_FUNCTION, the source holds the named function in the navigation
+    authority document, at method ≥ DELEGATED, under the document's current revision. HUMAN_ORDER
+    is refused, failing closed: `navigation_state` names no order id, so a current order cannot be
+    told from a stale one.
+  - **EXECUTION:** under DIRECT, the source holds the conn itself; under CARRY_OUT, the named
+    mapping is the DOF's and executes this source.
+
+  Then the per-DOF test runs. A navigator that holds `track_keeping` but not `collision_avoidance`
+  cannot smuggle an avoidance through: EXECUTION passes and DECISION refuses.
+- **`resolved_control`, every cycle.** For each DOF it reports:
+  - the requested and accepted values. The accepted value is **absent when the gate emits
+    nothing**, never 0;
+  - the control state and its reason;
+  - feedback marked NONE, since no connector reports what it applied yet.
+
+  The message also carries the motion fence, a message sequence and a sequence per coupled group.
 - **A lost store is a new term.** If the store is missing, corrupt or fails its hash, the gate
   reinitialises with no map and enters the transition state. Every command from before is then from
   a term that no longer exists. That is the safe direction for an enforcer, unlike the manager,
@@ -62,6 +83,9 @@ sample has to pass the gate's own test before it reaches actuation.
 | hears `command_authority/{vessel}` and `…/{vessel}/{overall,navigational}/session` | the holder's lease and the sessions, stamped on local receipt |
 | hears `command_assignment/{vessel}` | its own projection, for the direct abort |
 | hears `safety_state/{vessel}` | ACTUATION_ALLOWED |
+| hears `control_candidate/**` and `guidance_candidate/**` | the helm's and the navigator's proposals, per DOF |
+| hears `command_authority/{vessel}/navigation` | the navigation authority document, for DECISION |
+| publishes `resolved_control/{vessel}` | every cycle: the rolling acknowledgement |
 
 ## Developing before the build
 
@@ -81,10 +105,9 @@ is not installed.
 
 ## Not in this cut (#85's later slices)
 
-- **The candidate subjects** (`stream_id` + `sequence`) and **`ResolvedControl`** on `resolved_control`.
-  Both need a keelson PR. Until then samples reach the gate only in-process, and it resolves to a log.
-- **The guidance double-check (I15).** For a `GuidanceCandidate`, the DECISION and EXECUTION checks,
-  run independently.
+- **HUMAN_ORDER verification**, which needs an order id on `navigation_state`.
+- **Comparing a function envelope (knots) with a DOF's percent.** The DOF's execution envelope still
+  bounds the value.
 - **Each navigation function's `holder_lease_id`**, and its `comms_loss_behaviour` when that lapses.
 - **Constraint clamping** (`propulsion_constraint`, `motion_constraint`), keeping a latched constraint
   when its writer dies (I5), and restore-and-rebase on a new term (I16).

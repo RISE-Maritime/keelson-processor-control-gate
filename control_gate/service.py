@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import dataclass
 
 from . import model
 from .model import Ack, DirectAbort, Fence, Policy, Proposal, Sample
@@ -22,6 +23,20 @@ log = logging.getLogger(__name__)
 
 def mono_ms() -> int:
     return int(time.monotonic() * 1000)
+
+
+@dataclass(frozen=True)
+class Cycle:
+    """One resolution, with everything ResolvedControl carries (codec.resolved_control)."""
+
+    rows: tuple
+    fence: Fence
+    sequence: int
+    groups: tuple  # (group_id, sequence)
+    actuation_allowed: bool
+    actuation_reason: str
+    in_transition: bool
+    transition_reason: str
 
 
 class Gate:
@@ -34,6 +49,9 @@ class Gate:
         self.lock = threading.RLock()
         self.state: model.State | None = None
         self.events: list[str] = []  # what changed authority, for the log and the tests
+        self.sequence = 0  # ResolvedControl's, per incarnation of this process
+        self.group_sequences: dict[str, int] = {}
+        self.last_cycle: Cycle | None = None
 
     def boot(self) -> model.State:
         with self.lock:
@@ -104,6 +122,17 @@ class Gate:
             self.state, ok, why = model.on_sample(self.state, self.policy, s, self.now_ms())
             return ok, why
 
+    def guidance(self, g: model.Guidance) -> tuple[bool, str]:
+        with self.lock:
+            self.state, ok, why = model.on_guidance(self.state, self.policy, g, self.now_ms())
+            if not ok:
+                log.debug("guidance %s %s refused: %s", g.source, g.dof, why)
+            return ok, why
+
+    def observe_navigation(self, revision, functions):
+        with self.lock:
+            self.state = model.observe_navigation(self.state, revision, functions)
+
     # ------------------------------------------------------------------ the cycle
 
     def cycle(self):
@@ -117,5 +146,13 @@ class Gate:
                 log.warning("FENCED ALONE at generation %d: %s", st.generation, fenced)
             st, rows = model.resolve(st, self.policy, now)
             self.state = st
+            allowed, why = model.actuation_allowed(st, self.policy, now)
+            self.sequence += 1
+            groups = []
+            for gid in sorted(self.policy.groups):
+                self.group_sequences[gid] = self.group_sequences.get(gid, 0) + 1
+                groups.append((gid, self.group_sequences[gid]))
+            cycle = Cycle(rows, st.fence, self.sequence, tuple(groups), allowed, why, st.in_transition, st.transition_reason)
         self.actuator.apply(rows)
+        self.last_cycle = cycle
         return rows

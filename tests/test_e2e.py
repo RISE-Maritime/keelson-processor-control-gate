@@ -196,3 +196,52 @@ def test_the_manager_and_the_gate_as_two_processes(h):
                                      mappings=rows), am.AuthorityReply)
     assert (r.result, r.refusal) == (CommandResult.COMMAND_RESULT_DENIED, am.Refusal.REFUSAL_GATE)
     assert "no fresh sample" in r.detail and _state(h).fence.generation == gate.fence.generation
+
+
+def test_a_helm_on_the_bus_steers_and_resolved_control_shows_it(h):
+    """#272: a ControlCandidate on the bus reaches the gate; the gate's ResolvedControl is its answer."""
+    from keelson.payloads.ControlCandidate_pb2 import ControlCandidate
+    from keelson.payloads.GuidanceCandidate_pb2 import CandidateStream
+    from keelson.payloads.ResolvedControl_pb2 import ResolvedControl
+
+    resolved = []
+    sub = h.session.declare_subscriber(f"{BASE}/resolved_control/{V}", lambda s: resolved.append(_dec(s, ResolvedControl)))
+    try:
+        h.start_gate()
+        h.clear()
+        h.put(f"command_authority/{V}", CommandAuthority(vessel_id=V, controller_id="ted@ROC-1", token="tok", lease_ttl_seconds=60,
+                                                         role=Role.ROLE_CONN))
+        seq = {"n": 0}
+
+        def helm(dof, value):
+            seq["n"] += 1
+            h.put(f"control_candidate/helm-1/{dof}", ControlCandidate(source=f"ROC-1/helm-1/{dof}", dof=dof, value_pct=value,
+                                                                      stream=CandidateStream(stream_id="s1", sequence=seq["n"])))
+
+        for d in DOFS:
+            helm(d, 0)
+        time.sleep(0.3)
+        rows = [ControlMapping(dof=d, mapping_id=d, authority_holder="ted@ROC-1", authority_lease_id="tok",
+                               execution_source=f"ROC-1/helm-1/{d}") for d in DOFS]
+        ack = h.gate("prepare", TransferPrepare(transfer_id="g1", vessel_id=V, kind=TransferKind.TRANSFER_KIND_GRANT, mappings=rows,
+                                                active_control_station="ROC-1", prepare_ttl_ms=2000), TransferAck)
+        assert ack.accepted, ack.reason
+        assert h.gate("commit", TransferCommit(transfer_id="g1", fence=ack.proposed_fence), CommitResponse).applied
+        helm("rudder", 15)
+
+        def steering():
+            if not resolved:
+                return False
+            d = {r.dof: r for r in resolved[-1].dofs}
+            return d["rudder"].HasField("accepted_pct") and d["rudder"].accepted_pct == 15 and d["rudder"].control_state == 1
+        h.wait(steering, what="ResolvedControl to show the helm's rudder")
+        last = resolved[-1]
+        assert last.actuation_allowed and last.motion_epoch.generation == ack.proposed_fence.generation and last.gate_id == "control-gate"
+    finally:
+        sub.undeclare()
+
+
+def _dec(sample, cls):
+    msg = cls()
+    msg.ParseFromString(keelson.uncover(sample.payload.to_bytes())[2])
+    return msg

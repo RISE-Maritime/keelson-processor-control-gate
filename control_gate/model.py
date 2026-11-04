@@ -135,6 +135,39 @@ class Sample:
 
 
 @dataclass(frozen=True)
+class Guidance:
+    """One GuidanceCandidate from the navigator: a Sample plus the two bases it claims.
+
+    decision   "nav_function" (with `function` and `nav_revision`), "human_order" (with
+               `order_id`), or "" for none
+    execution  "direct", "carry_out" (with `mapping_id`), or "" for none"""
+
+    source: str
+    dof: str
+    value_pct: float
+    stream_id: str
+    sequence: int
+    recv_ms: int
+    decision: str = ""
+    function: str = ""  # e.g. "track_keeping", as the navigation authority document names it
+    nav_revision: int = 0
+    order_id: str = ""
+    execution: str = ""
+    mapping_id: str = ""
+
+
+@dataclass(frozen=True)
+class NavDoc:
+    """The navigation authority document, as last heard: revision, and per function (holder, method)."""
+
+    revision: int
+    functions: dict  # function -> (holder principal, control method 1..5)
+
+
+CONTROL_METHOD_DELEGATED = 3
+
+
+@dataclass(frozen=True)
 class Resolved:
     """One DOF of one cycle: what was asked, what goes out, and why. `value` None = emit nothing."""
 
@@ -168,6 +201,7 @@ class State:
     latest: dict = field(default_factory=dict)  # (source, dof) -> Sample, every ordered sample heard
     accepted: dict = field(default_factory=dict)  # dof -> Sample that passed the test
     emitting: dict = field(default_factory=dict)  # dof -> value last resolved
+    navigation: NavDoc | None = None  # the navigation authority document, for DECISION
 
     @property
     def fence(self) -> Fence:
@@ -196,6 +230,7 @@ class Policy:
     safety_ttl_ms: int = 15000  # the supervisor republishes at 5 s
     require_safety_state: bool = True  # False only in a test rig with no supervisor, and labelled so
     lease_grace_ms: int = 5000  # after boot, before an unheard holder's lease counts as lapsed
+    groups: dict = field(default_factory=dict)  # group_id -> dofs that move together (ResolvedControl)
 
     def transition_value(self, dof: str) -> float:
         return float(self.transition_values.get(dof, 0.0))
@@ -397,6 +432,79 @@ def on_sample(st: State, pol: Policy, s: Sample, now_ms: int) -> tuple[State, bo
     if not allowed:
         return st, False, why
     return replace(st, accepted={**st.accepted, s.dof: s}), True, ""
+
+
+# ---------------------------------------------------------------------------- guidance (I15)
+
+
+def observe_navigation(st: State, revision: int, functions: dict) -> State:
+    return replace(st, navigation=NavDoc(int(revision), dict(functions)))
+
+
+def _is(principal: str, source: str) -> bool:
+    """A principal ("navigation/0@usv-alpha") names the process a source ("navigation/0") spells."""
+    return bool(source) and (principal == source or principal.split("@", 1)[0] == source)
+
+
+def decision_check(st: State, g: Guidance) -> str:
+    """May this source DECIDE this? "" when it may, else why not. Independent of EXECUTION (I15).
+
+    NAV_FUNCTION: the source holds the named function in the navigation authority document, at
+    control method ≥ DELEGATED, under the document's current revision. HUMAN_ORDER is refused,
+    failing closed: navigation_state names no order id, so a current order cannot be told from a
+    stale one (protocols/control_gate.yaml, not_solved)."""
+    if g.decision == "human_order":
+        return "HUMAN_ORDER cannot be verified: navigation_state names no order id"
+    if g.decision != "nav_function":
+        return "no decision basis"
+    doc = st.navigation
+    if doc is None:
+        return "no navigation authority document heard"
+    held = doc.functions.get(g.function)
+    if held is None or not _is(held[0], g.source):
+        return f"{g.source} does not hold {g.function}"
+    if held[1] < CONTROL_METHOD_DELEGATED:
+        return f"{g.function} is held at method {held[1]}, below DELEGATED"
+    if g.nav_revision != doc.revision:
+        return f"decided under navigation revision {g.nav_revision}, the document is at {doc.revision}"
+    return ""
+
+
+def execution_check(st: State, g: Guidance, now_ms: int) -> str:
+    """May this source EXECUTE this? "" when it may, else why not. Independent of DECISION (I15).
+
+    DIRECT: the source holds the conn itself (full automation). CARRY_OUT: the DOF's mapping is the
+    one named, and that mapping's execution_source is this source -- the human's conn, pre-authorised
+    carry-out. The per-DOF test (on_sample) then still runs: the holder's lease, the fence, the
+    envelope."""
+    m = st.mapping(g.dof)
+    if g.execution == "direct":
+        lease = st.leases.get("conn")
+        if lease is None or not lease.live(now_ms) or not _is(lease.holder, g.source):
+            return f"DIRECT, but {g.source} does not hold the conn"
+        return ""
+    if g.execution == "carry_out":
+        if m is None or not g.mapping_id or m.mapping_id != g.mapping_id:
+            return f"CARRY_OUT names mapping {g.mapping_id or '(none)'}, which is not this DOF's"
+        if m.execution_source != g.source:
+            return f"CARRY_OUT, but the mapping's execution source is {m.execution_source}"
+        return ""
+    return "no execution basis"
+
+
+def on_guidance(st: State, pol: Policy, g: Guidance, now_ms: int) -> tuple[State, bool, str]:
+    """A guidance candidate: DECISION and EXECUTION, each refusing on its own, then the per-DOF test.
+    A refused guidance sample is still remembered for ordering, so a later one is judged in order."""
+    why = decision_check(st, g)
+    if not why:
+        why = execution_check(st, g, now_ms)
+    sample = Sample(g.source, g.dof, g.value_pct, g.stream_id, g.sequence, g.recv_ms)
+    if why:
+        known = st.streams.get(g.source)
+        if known is None or known.stream_id != g.stream_id or g.sequence > known.last_sequence:
+            st = replace(st, streams={**st.streams, g.source: Stream(g.stream_id, g.sequence)})
+        return st, False, why
+    return on_sample(st, pol, sample, now_ms)
 
 
 def resolve(st: State, pol: Policy, now_ms: int) -> tuple[State, tuple[Resolved, ...]]:

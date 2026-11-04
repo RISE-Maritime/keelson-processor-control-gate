@@ -8,8 +8,10 @@ assignee when the manager is unhealthy), and it hears:
 - `command_assignment` -- its own projection, for the direct abort;
 - `safety_state` -- ACTUATION_ALLOWED.
 
-It resolves every DOF at --rate-hz. This cut emits to a LOGGING actuator only: no candidate subject
-exists yet (no sample reaches it over the bus) and nothing consumes ResolvedControl (README).
+It hears the candidates -- `control_candidate/**` (a station's helm) and `guidance_candidate/**` (the
+navigator, checked for DECISION and EXECUTION, I15) -- and the navigation authority document, and
+publishes `resolved_control/{vessel}` every cycle at --rate-hz: the rolling acknowledgement and the only
+thing downstream consumes. The actuator itself is still a LOGGING one (README).
 """
 
 import argparse
@@ -21,7 +23,10 @@ import time
 import keelson
 import zenoh
 from keelson.interfaces.ControlGate_pb2 import AbortAutomationRequest, GetGateStateRequest
+from google.protobuf.timestamp_pb2 import Timestamp
 from keelson.payloads.CommandAuthority_pb2 import CommandAssignment, CommandAuthority
+from keelson.payloads.ControlCandidate_pb2 import ControlCandidate
+from keelson.payloads.GuidanceCandidate_pb2 import GuidanceCandidate
 from keelson.payloads.ControlMapping_pb2 import TransferCommit, TransferPrepare
 from keelson.payloads.SafetyState_pb2 import SafetyState
 from keelson.scaffolding import add_common_arguments, create_zenoh_config, setup_logging
@@ -79,6 +84,8 @@ def main() -> int:
             ttl = int(rec.lease_ttl_seconds) * 1000
             if path == vessel:
                 gate.observe_lease("conn", rec.controller_id, rec.token, ttl, rec.released)
+            elif path == f"{vessel}/navigation" and rec.HasField("navigation_authority"):
+                gate.observe_navigation(*codec.navigation_from_record(rec))
             elif path in (f"{vessel}/overall/session", f"{vessel}/navigational/session"):
                 role = path.split("/")[1]
                 gate.observe_session(role, rec.controller_id, rec.token, rec.assignment.assignment_id if rec.HasField("assignment") else "",
@@ -102,7 +109,18 @@ def main() -> int:
                     log.exception("could not handle %s", sample.key_expr)
             return run
 
+        def mono_ms():
+            return int(time.monotonic() * 1000)
+
+        def on_control_candidate(sample):
+            gate.sample(codec.sample_from_control_candidate(_decode(sample, ControlCandidate), mono_ms()))
+
+        def on_guidance_candidate(sample):
+            gate.guidance(codec.guidance_from_proto(_decode(sample, GuidanceCandidate), mono_ms()))
+
         subs = [
+            session.declare_subscriber(f"{base}/control_candidate/**", guarded(on_control_candidate)),
+            session.declare_subscriber(f"{base}/guidance_candidate/**", guarded(on_guidance_candidate)),
             session.declare_subscriber(f"{base}/command_authority/**", guarded(on_authority)),
             session.declare_subscriber(f"{base}/command_assignment/{vessel}", guarded(on_assignment)),
             session.declare_subscriber(f"{base}/safety_state/{vessel}", guarded(on_safety)),
@@ -143,6 +161,11 @@ def main() -> int:
                 t0 = time.monotonic()
                 try:
                     gate.cycle()
+                    if gate.last_cycle is not None:
+                        ts = Timestamp()
+                        ts.GetCurrentTime()
+                        rc = codec.resolved_control(gate.last_cycle, vessel, args.source_id, ts)
+                        session.put(f"{base}/resolved_control/{vessel}", keelson.enclose(rc.SerializeToString()))
                 except Exception:  # pylint: disable=broad-except
                     log.exception("cycle failed")
                 time.sleep(max(0.0, period - (time.monotonic() - t0)))
