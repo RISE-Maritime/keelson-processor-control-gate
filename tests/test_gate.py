@@ -437,11 +437,11 @@ def test_i15_each_decision_refusal_on_its_own(tmp_path, clock):
     assert "below DELEGATED" in _guide(g, clock)[1]
     g = _carry_out(tmp_path / "b", clock)
     assert "revision" in _guide(g, clock, nav_revision=6)[1]
-    assert "HUMAN_ORDER cannot be verified" in _guide(g, clock, decision="human_order", order_id="o-1")[1]
+    assert "no navigation_state heard from navigation/0" in _guide(g, clock, decision="human_order", order_id="o-1")[1]
     assert "no decision basis" in _guide(g, clock, decision="")[1]
     g2 = make(tmp_path / "c", clock)
-    assert "no navigation authority document" in model.decision_check(g2.state, model.Guidance(
-        NAV, "rudder", 0, "n", 1, 0, decision="nav_function", function="track_keeping", nav_revision=1))
+    assert "no navigation authority document" in model.decision_check(g2.state, g2.policy, model.Guidance(
+        NAV, "rudder", 0, "n", 1, 0, decision="nav_function", function="track_keeping", nav_revision=1), 0)
 
 
 def test_i15_each_execution_refusal_on_its_own(tmp_path, clock):
@@ -527,3 +527,69 @@ def test_a_refused_guidance_sample_is_still_what_the_source_says_for_neutral_or_
     nav_rows = tuple(Mapping(d, TED, TOKEN, NAV, (), "", f"m-{d}") for d in DOFS)
     ack = g.prepare(Proposal("t1", model.GRANT, nav_rows, "ROC-1", 2000, TED))
     assert ack.accepted, ack.reason
+
+
+# ---------------------------------------------------------------------------- HUMAN_ORDER (crowsnest-dev#94)
+
+
+def _ordered(tmp_path, clock, order_id="o-7", producer="navigation/0/conduct"):
+    """A human holds the conn; navigation/0 carries out their order o-7 under it."""
+    g = _carry_out(tmp_path, clock, functions={})  # the navigator holds no function: only the order decides
+    g.observe_navigation_state(producer, order_id)
+    return g
+
+
+def _order(g, clock, order_id="o-7", **kw):
+    return _guide(g, clock, decision="human_order", order_id=order_id, function="", nav_revision=0, **kw)
+
+
+def test_human_order_passes_when_it_is_the_order_in_force_on_a_fresh_record(tmp_path, clock):
+    g = _ordered(tmp_path, clock)
+    ok, why = _order(g, clock)
+    assert ok, why
+    assert g.state.accepted["rudder"].value_pct == 5.0
+
+
+@pytest.mark.parametrize("setup,order_id,why", [
+    (lambda g, c: None, "o-6", "order o-6 is not the one in force (o-7)"),
+    (lambda g, c: None, "", "HUMAN_ORDER names no order id"),
+    (lambda g, c: g.observe_navigation_state("navigation/0/conduct", None), "o-7", "reports no human order in force"),
+    (lambda g, c: setattr(c, "t", c.t + 3001), "o-7", "not heard for 3001 ms"),
+    (lambda g, c: g.observe_navigation_state("navigation/0/other", "o-7"), "o-7", "more than one navigation_state under navigation/0"),
+])
+def test_human_order_refusals(tmp_path, clock, setup, order_id, why):
+    g = _ordered(tmp_path, clock)
+    setup(g, clock)
+    ok, got = _order(g, clock, order_id)
+    assert not ok and why in got
+
+
+def test_another_navigators_record_is_not_this_sources(tmp_path, clock):
+    g = _carry_out(tmp_path, clock, functions={})
+    g.observe_navigation_state("navigation/01/conduct", "o-7")  # a prefix, not a chunk boundary
+    ok, why = _order(g, clock)
+    assert not ok and "no navigation_state heard from navigation/0" in why
+
+
+def test_a_stale_second_producer_does_not_make_it_ambiguous(tmp_path, clock):
+    g = _carry_out(tmp_path, clock, functions={})
+    g.observe_navigation_state("navigation/0/old", "o-1")
+    clock.t += 3001
+    lease(g)  # the holder renews meanwhile; only the old record has gone stale
+    g.observe_navigation_state("navigation/0/conduct", "o-7")
+    ok, why = _order(g, clock)
+    assert ok, why
+
+
+def test_human_order_still_needs_execution(tmp_path, clock):
+    """DECISION passing implies nothing about EXECUTION (I15)."""
+    g = _ordered(tmp_path, clock)
+    ok, why = _order(g, clock, mapping_id="m-throttle")
+    assert not ok and "not this DOF's" in why
+
+
+def test_the_order_freshness_window_is_policy(tmp_path, clock):
+    from control_gate.policy import parse
+
+    assert parse({"dofs": ["rudder"], "navigation_state_max_age_ms": 4500}).navigation_state_max_age_ms == 4500
+    assert parse({"dofs": ["rudder"]}).navigation_state_max_age_ms == 3000

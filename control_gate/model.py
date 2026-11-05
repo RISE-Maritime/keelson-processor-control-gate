@@ -157,6 +157,15 @@ class Guidance:
 
 
 @dataclass(frozen=True)
+class NavStateSeen:
+    """One producer's latest `navigation_state`: the human decision it says is in force, if any,
+    stamped on the gate's clock at local receipt. What a HUMAN_ORDER basis is checked against."""
+
+    order_id: str | None
+    recv_ms: int
+
+
+@dataclass(frozen=True)
 class NavDoc:
     """The navigation authority document, as last heard: revision, and per function (holder, method)."""
 
@@ -202,6 +211,7 @@ class State:
     accepted: dict = field(default_factory=dict)  # dof -> Sample that passed the test
     emitting: dict = field(default_factory=dict)  # dof -> value last resolved
     navigation: NavDoc | None = None  # the navigation authority document, for DECISION
+    nav_states: dict = field(default_factory=dict)  # navigation_state producer -> NavStateSeen
 
     @property
     def fence(self) -> Fence:
@@ -231,6 +241,7 @@ class Policy:
     require_safety_state: bool = True  # False only in a test rig with no supervisor, and labelled so
     lease_grace_ms: int = 5000  # after boot, before an unheard holder's lease counts as lapsed
     groups: dict = field(default_factory=dict)  # group_id -> dofs that move together (ResolvedControl)
+    navigation_state_max_age_ms: int = 3000  # a HUMAN_ORDER is checked against a record this fresh
 
     def transition_value(self, dof: str) -> float:
         return float(self.transition_values.get(dof, 0.0))
@@ -441,20 +452,47 @@ def observe_navigation(st: State, revision: int, functions: dict) -> State:
     return replace(st, navigation=NavDoc(int(revision), dict(functions)))
 
 
+def observe_navigation_state(st: State, producer: str, order_id: str | None, recv_ms: int) -> State:
+    return replace(st, nav_states={**st.nav_states, producer: NavStateSeen(order_id or None, recv_ms)})
+
+
+def _human_order_check(st: State, pol: Policy, g: Guidance, now_ms: int) -> str:
+    """HUMAN_ORDER{order_id}: the id must be the human decision in force in the source's latest
+    navigation_state, heard fresh on the gate's clock (keelson navigation_conduct, order_id). The
+    source's records are the producers it spells: `navigation/0` or `navigation/0/...`. None fresh,
+    or more than one, refuses: a current order cannot be told from a stale one, or from another's."""
+    if not g.order_id:
+        return "HUMAN_ORDER names no order id"
+    mine = {p: n for p, n in st.nav_states.items() if p == g.source or p.startswith(f"{g.source}/")}
+    fresh = {p: n for p, n in mine.items() if now_ms - n.recv_ms <= pol.navigation_state_max_age_ms}
+    if not fresh:
+        if not mine:
+            return f"no navigation_state heard from {g.source}"
+        age = min(now_ms - n.recv_ms for n in mine.values())
+        return f"navigation_state from {g.source} not heard for {age} ms"
+    if len(fresh) > 1:
+        return f"more than one navigation_state under {g.source}: {', '.join(sorted(fresh))}"
+    (producer, seen), = fresh.items()
+    if seen.order_id is None:
+        return f"{producer} reports no human order in force"
+    if seen.order_id != g.order_id:
+        return f"order {g.order_id} is not the one in force ({seen.order_id})"
+    return ""
+
+
 def _is(principal: str, source: str) -> bool:
     """A principal ("navigation/0@usv-alpha") names the process a source ("navigation/0") spells."""
     return bool(source) and (principal == source or principal.split("@", 1)[0] == source)
 
 
-def decision_check(st: State, g: Guidance) -> str:
+def decision_check(st: State, pol: Policy, g: Guidance, now_ms: int) -> str:
     """May this source DECIDE this? "" when it may, else why not. Independent of EXECUTION (I15).
 
     NAV_FUNCTION: the source holds the named function in the navigation authority document, at
-    control method ≥ DELEGATED, under the document's current revision. HUMAN_ORDER is refused,
-    failing closed: navigation_state names no order id, so a current order cannot be told from a
-    stale one (protocols/control_gate.yaml, not_solved)."""
+    control method ≥ DELEGATED, under the document's current revision. HUMAN_ORDER: the order id is
+    the one in force in the source's fresh navigation_state (_human_order_check)."""
     if g.decision == "human_order":
-        return "HUMAN_ORDER cannot be verified: navigation_state names no order id"
+        return _human_order_check(st, pol, g, now_ms)
     if g.decision != "nav_function":
         return "no decision basis"
     doc = st.navigation
@@ -495,7 +533,7 @@ def execution_check(st: State, g: Guidance, now_ms: int) -> str:
 def on_guidance(st: State, pol: Policy, g: Guidance, now_ms: int) -> tuple[State, bool, str]:
     """A guidance candidate: DECISION and EXECUTION, each refusing on its own, then the per-DOF test.
     A refused guidance sample is still remembered for ordering, so a later one is judged in order."""
-    why = decision_check(st, g)
+    why = decision_check(st, pol, g, now_ms)
     if not why:
         why = execution_check(st, g, now_ms)
     sample = Sample(g.source, g.dof, g.value_pct, g.stream_id, g.sequence, g.recv_ms)

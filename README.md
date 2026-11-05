@@ -55,9 +55,12 @@ sample has to pass the gate's own test before it reaches actuation.
 - **A guidance candidate is checked twice, independently (I15).** The navigator's
   `GuidanceCandidate` must pass both:
   - **DECISION:** under NAV_FUNCTION, the source holds the named function in the navigation
-    authority document, at method ≥ DELEGATED, under the document's current revision. HUMAN_ORDER
-    is refused, failing closed: `navigation_state` names no order id, so a current order cannot be
-    told from a stale one.
+    authority document, at method ≥ DELEGATED, under the document's current revision. Under
+    HUMAN_ORDER, the `order_id` is the human decision in force in the source's latest
+    `navigation_state`, heard within `navigation_state_max_age_ms` (default 3000) on the gate's
+    clock (keelson `NavigationState.order_id`, crowsnest-dev#94). The source's records are the
+    producers it spells, `navigation/0` or `navigation/0/…`. If none is fresh, if more than one
+    is, or if the record reports no order, the candidate is refused.
   - **EXECUTION:** under DIRECT, the source holds the conn itself; under CARRY_OUT, the named
     mapping is the DOF's and executes this source.
 
@@ -85,6 +88,7 @@ sample has to pass the gate's own test before it reaches actuation.
 | hears `safety_state/{vessel}` | ACTUATION_ALLOWED |
 | hears `control_candidate/**` and `guidance_candidate/**` | the helm's and the navigator's proposals, per DOF |
 | hears `command_authority/{vessel}/navigation` | the navigation authority document, for DECISION |
+| hears `navigation_state/**` | each producer's human order in force, for HUMAN_ORDER, stamped on local receipt |
 | publishes `resolved_control/{vessel}` | every cycle: the rolling acknowledgement |
 
 ## Developing before the build
@@ -102,6 +106,12 @@ uv pip install --python .venv/bin/python --no-deps -e ../keelson-processor-contr
 
 The joint tests (`tests/test_with_manager.py`, and the two-process e2e) are skipped when the manager
 is not installed.
+
+**HUMAN_ORDER needs `NavigationState.order_id`,** from keelson's `feat/navigation-state-order-id`,
+stacked on #376. `0.6.0.dev21` does not carry it. On that build every `navigation_state` reads as
+"no human order in force", so HUMAN_ORDER is still refused: the check fails closed, as before. To
+develop against it, install a local SDK carrying both that branch and the pin's PRs. The joint e2e
+also needs the manager's maintenance PR (#377).
 
 ## Not in this cut (#85's later slices)
 

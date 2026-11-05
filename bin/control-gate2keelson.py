@@ -28,6 +28,7 @@ from keelson.payloads.CommandAuthority_pb2 import CommandAssignment, CommandAuth
 from keelson.payloads.ControlCandidate_pb2 import ControlCandidate
 from keelson.payloads.GuidanceCandidate_pb2 import GuidanceCandidate
 from keelson.payloads.ControlMapping_pb2 import TransferCommit, TransferPrepare
+from keelson.payloads.NavigationState_pb2 import NavigationState
 from keelson.payloads.SafetyState_pb2 import SafetyState
 from keelson.scaffolding import add_common_arguments, create_zenoh_config, setup_logging
 from keelson.scaffolding.liveliness import declare_liveliness
@@ -118,9 +119,16 @@ def main() -> int:
         def on_guidance_candidate(sample):
             gate.guidance(codec.guidance_from_proto(_decode(sample, GuidanceCandidate), mono_ms()))
 
+        def on_navigation_state(sample):
+            # The producer is the key's remainder after the subject: what a HUMAN_ORDER's source spells.
+            producer = str(sample.key_expr).split("/navigation_state/", 1)[1]
+            ns = _decode(sample, NavigationState)
+            gate.observe_navigation_state(producer, ns.order_id if ns.HasField("order_id") else None)
+
         subs = [
             session.declare_subscriber(f"{base}/control_candidate/**", guarded(on_control_candidate)),
             session.declare_subscriber(f"{base}/guidance_candidate/**", guarded(on_guidance_candidate)),
+            session.declare_subscriber(f"{base}/navigation_state/**", guarded(on_navigation_state)),
             session.declare_subscriber(f"{base}/command_authority/**", guarded(on_authority)),
             session.declare_subscriber(f"{base}/command_assignment/{vessel}", guarded(on_assignment)),
             session.declare_subscriber(f"{base}/safety_state/{vessel}", guarded(on_safety)),

@@ -30,6 +30,7 @@ def parse(d: dict) -> Policy:
         require_safety_state=bool(d.get("require_safety_state", True)),
         lease_grace_ms=int(d.get("lease_grace_ms", 5000)),
         groups={str(k): tuple(v) for k, v in (d.get("groups") or {}).items()},
+        navigation_state_max_age_ms=int(d.get("navigation_state_max_age_ms", 3000)),
     )
 
 

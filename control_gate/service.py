@@ -133,6 +133,10 @@ class Gate:
         with self.lock:
             self.state = model.observe_navigation(self.state, revision, functions)
 
+    def observe_navigation_state(self, producer: str, order_id: str | None):
+        with self.lock:
+            self.state = model.observe_navigation_state(self.state, producer, order_id, self.now_ms())
+
     # ------------------------------------------------------------------ the cycle
 
     def cycle(self):
