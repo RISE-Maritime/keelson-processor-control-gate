@@ -105,7 +105,10 @@ uv pip install --python .venv/bin/python --no-deps -e ../keelson-processor-contr
 ```
 
 The joint tests (`tests/test_with_manager.py`, and the two-process e2e) are skipped when the manager
-is not installed.
+is not installed. `tests/test_with_navigator.py` runs the navigator's own guidance candidates
+through `on_guidance`, under NAV_FUNCTION, HUMAN_ORDER and DIRECT. It is skipped unless
+keelson-processor-navigation is installed the same way (`uv pip install --no-deps -e
+../keelson-processor-navigation`).
 
 **HUMAN_ORDER needs `NavigationState.order_id`,** from keelson's `feat/navigation-state-order-id`,
 stacked on #376. `0.6.0.dev21` does not carry it. On that build every `navigation_state` reads as
