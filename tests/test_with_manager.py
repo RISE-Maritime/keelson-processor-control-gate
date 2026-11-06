@@ -50,7 +50,10 @@ class InProcess:
         st = self.gate.exposed()
         rows = tuple(m.Mapping(r.dof, r.authority_holder, r.authority_lease_id, r.execution_source, r.envelope, r.group_id,
                                r.mapping_id) for r in st.mappings)
-        return m.Fence(st.term, st.generation), rows, st.station
+        c = st.last_cause
+        cause = None if c is None else m.GateCause(c.kind, m.Fence(c.fence.term, c.fence.generation), c.requested_by,
+                                                   c.assignment_id, c.assignment_revision, c.reason)
+        return m.Fence(st.term, st.generation), rows, st.station, cause
 
 
 class Bus:
@@ -197,3 +200,49 @@ def test_a_payload_change_of_hands_fences_the_payload_and_not_the_helm(plant):
     gate.cycle()
     assert gate.state.fence == motion and gate.state.mappings == mapped and not gate.state.in_transition
     assert gate.state.plant_generation == 1
+
+
+# ---------------------------------------------------------------------------- crowsnest-dev#290
+
+
+def test_an_abort_the_gate_ran_alone_is_completed_by_the_manager_at_reconcile(tmp_path):
+    """The real gate's direct abort, with the manager down; a fresh manager boots against it and takes the
+    navigator's functions back to the human who asked, at method 2, once."""
+    clock = Clock()
+    gate = Gate(store=Store(tmp_path / "gate.sqlite"), policy=parse({"dofs": DOFS, "automation_sources": ["navigation/0"]}),
+                vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
+    gate.boot()
+    gate.observe_safety(g.SAFETY_CLEAR, False)
+    bus = AllLeases()
+    bus.gate = gate
+    pol = manager_policy({"dofs": DOFS, "automation_sources": ["navigation/0"], "processes": ["navigation/0@usv-alpha"]})
+    mgr = Manager(store=ManagerStore(tmp_path / "authority.sqlite"), policy=pol, vessel_id=V, gate=InProcess(gate),
+                  publish=bus, now_ms=clock)
+    mgr.boot()
+    mgr.assign(m.OVERALL, "ted@ROC-1", "procedure")
+    mgr.session(m.OVERALL, "ted@ROC-1", "ROC-1", "sess-1", mgr.state.overall.assignment_id)
+    mgr.assign(m.NAVIGATIONAL, "anna@ROC-2", "ted@ROC-1", mgr.state.overall.revision, "sess-1")
+    nav = mgr.state.navigational
+    mgr.session(m.NAVIGATIONAL, "anna@ROC-2", "ROC-2", "sess-2", nav.assignment_id)
+    helm(gate, clock, "ROC-1")
+    assert mgr.transfer(m.TransferRequest(m.GRANT, "ted@ROC-1", "ROC-1", mappings=rows("ROC-1"))).outcome == m.ACCEPTED
+    for f, method in (("collision_avoidance", 3), ("track_keeping", 4)):
+        assert mgr.set_navigation_function(f, m.NavFunction("navigation/0@usv-alpha", "nav-live", method), "anna@ROC-2",
+                                           nav.revision, "sess-2").outcome == m.ACCEPTED
+    rev = mgr.state.navigation_revision
+
+    # The manager dies. Anna aborts automation at the gate directly; the gate verifies her on its own projection.
+    mgr.store.close()
+    gate.observe_assignments(None, g.AssignmentSeen("anna@ROC-2", nav.assignment_id, nav.revision), "authority-manager/0", 15000)
+    gate.observe_session(g.NAVIGATIONAL, "anna@ROC-2", "sess-2", nav.assignment_id, 30000, False)
+    ok, why, fence = gate.abort_direct(g.DirectAbort("anna@ROC-2", nav.assignment_id, nav.revision, "sess-2", "manager down"))
+    assert ok, why
+
+    mgr2 = Manager(store=ManagerStore(tmp_path / "authority.sqlite"), policy=pol, vessel_id=V, gate=InProcess(gate),
+                   publish=AllLeases(), now_ms=clock)
+    mgr2.boot()
+    assert mgr2.state.in_force.fence == m.Fence(fence.term, fence.generation)
+    for f in ("collision_avoidance", "track_keeping"):
+        fn = mgr2.state.navigation[f]
+        assert (fn.holder, fn.method, fn.holder_lease_id) == ("anna@ROC-2", 2, "sess-2")
+    assert mgr2.state.navigation_revision == rev + 1

@@ -52,6 +52,11 @@ sample has to pass the gate's own test before it reaches actuation.
   - **With the manager dead, the last session heard counts.** Sessions are renewed through the
     manager, so they lapse with it. The abort only ever makes the vessel more inhibited.
   - **Not a back door:** it fences the automation, proposes no map and grants nothing.
+  - **It says why, for the manager that missed it** (crowsnest-dev#290). Every fence the gate moves
+    alone records its cause with the fence it produced: an abort with the requester and the
+    assignment they acted under, a CONN lapse with nobody. The cause is persisted, cleared by the next
+    COMMIT, and exposed as `GateState.last_fence_cause` in the keelson builds that carry it. A manager
+    that was down reads it at reconcile and takes the navigator's functions back to that human.
 - **A guidance candidate is checked twice, independently (I15).** The navigator's
   `GuidanceCandidate` must pass both:
   - **DECISION:** under NAV_FUNCTION, the source holds the named function in the navigation

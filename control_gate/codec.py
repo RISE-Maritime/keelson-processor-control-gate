@@ -41,6 +41,11 @@ def constraint_to_proto(c: model.Constraint, vessel_id: str, ts) -> PropulsionCo
     return out
 
 
+# keelson GateState.last_fence_cause, in the builds that carry it (crowsnest-dev#290).
+HAS_FENCE_CAUSE = "last_fence_cause" in GateState.DESCRIPTOR.fields_by_name
+_CAUSE_KIND = {model.CAUSE_ABORT: 1, model.CAUSE_CONN_LAPSE: 2, model.CAUSE_INVALID_SOURCE: 3, model.CAUSE_LOCAL_FALLBACK: 4}
+
+
 def fence_to_proto(f: Fence) -> PbFence:
     return PbFence(term=f.term, generation=f.generation)
 
@@ -93,6 +98,14 @@ def gate_state(st: model.State) -> GateState:
                     mappings=[mapping_to_proto(m) for m in st.mappings], in_transition=st.in_transition)
     if st.reservation is not None:
         out.reserved_transfer_id = st.reservation.proposal.transfer_id
+    c = st.last_cause
+    if c is not None and HAS_FENCE_CAUSE:
+        # keelson GateState.last_fence_cause (crowsnest-dev#290); a build without it says nothing.
+        pc = out.last_fence_cause
+        pc.kind = _CAUSE_KIND.get(c.kind, 0)
+        pc.fence.CopyFrom(fence_to_proto(c.fence))
+        pc.requested_by, pc.assignment_id, pc.assignment_revision, pc.reason = (
+            c.requested_by, c.assignment_id, c.assignment_revision, c.reason)
     return out
 
 

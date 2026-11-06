@@ -91,6 +91,25 @@ class Constraint:
         return next((d for d in self.devices if d.device_id == device_id), None)
 
 
+# keelson GateState.last_fence_cause kinds (crowsnest-dev#290)
+CAUSE_ABORT, CAUSE_CONN_LAPSE, CAUSE_INVALID_SOURCE, CAUSE_LOCAL_FALLBACK = "abort_automation", "conn_lapse", "invalid_source", "local_fallback"
+
+
+@dataclass(frozen=True)
+class FenceCause:
+    """Why the gate last moved its fence ALONE, with the fence it produced. Cleared by the next COMMIT, so
+    it never describes a fence a transfer has since replaced. A manager that was down reads it at
+    reconcile: an abort it did not see must still take the automation's functions back to the human
+    who asked (crowsnest-dev#271/#290)."""
+
+    kind: str
+    fence: Fence
+    requested_by: str = ""
+    assignment_id: str = ""
+    assignment_revision: int = 0
+    reason: str = ""
+
+
 @dataclass(frozen=True)
 class Proposal:
     """A PREPARE. It carries no fence; a row that names one is refused (I2)."""
@@ -247,6 +266,7 @@ class State:
     plant_generation: int = 1  # under the same term: the motion gate's (Fence.proto)
     engineer_token: str = ""  # the ENGINEER token the current plant_generation belongs to
     constraint: Constraint | None = None  # the plant constraint in force; never lifted by silence
+    last_cause: FenceCause | None = None  # why the gate last fenced alone (#290); None since a COMMIT
     # ---- volatile: lost on restart by design (a reservation does not survive the gate, §4)
     reservation: Reservation | None = None
     boot_ms: int = 0
@@ -387,15 +407,20 @@ def commit(st: State, transfer_id: str, fence: Fence, now_ms: int) -> tuple[Stat
                   station=p.station if p.station else st.station,
                   in_transition=abort or not p.mappings,
                   transition_reason=f"abort automation by {p.requested_by}" if abort else "",
+                  # The fence moved by a transfer: a cause of an older fence must never be read against it.
+                  last_cause=None,
                   accepted={})  # every sample accepted under the old fence is from another authority
     return nxt, True, ""
 
 
-def fence_alone(st: State, reason: str) -> State:
+def fence_alone(st: State, reason: str, cause: str = CAUSE_CONN_LAPSE, **who) -> State:
     """Authority must change and nobody else can do it: increment the generation here, drop the map and
-    enter the transition state (§4). The manager reconciles afterwards."""
-    return replace(st, generation=st.generation + 1, mappings=(), in_transition=True, transition_reason=reason,
-                   reservation=None, accepted={})
+    enter the transition state (§4). The manager reconciles afterwards, and reads WHY in `last_cause`:
+    the kind, the fence it produced, and for an abort who asked (#290)."""
+    generation = st.generation + 1
+    return replace(st, generation=generation, mappings=(), in_transition=True, transition_reason=reason,
+                   reservation=None, accepted={},
+                   last_cause=FenceCause(cause, Fence(st.term, generation), reason=reason, **who))
 
 
 # ---------------------------------------------------------------------------- observations
@@ -736,5 +761,7 @@ def abort_direct(st: State, d: DirectAbort, now_ms: int) -> tuple[State, bool, s
             return st, False, f"no session of the {role.upper()} assignment with this token"
         if feed_live and not s.live(now_ms):
             return st, False, f"the {role.upper()} session has lapsed"
-        return fence_alone(st, f"abort automation by {d.requester} (direct){': ' + d.reason if d.reason else ''}"), True, ""
+        return fence_alone(st, f"abort automation by {d.requester} (direct){': ' + d.reason if d.reason else ''}",
+                           CAUSE_ABORT, requested_by=d.requester, assignment_id=a.assignment_id,
+                           assignment_revision=a.revision), True, ""
     return st, False, "not the NAVIGATIONAL_COMMAND or OVERALL_COMMAND assignee"

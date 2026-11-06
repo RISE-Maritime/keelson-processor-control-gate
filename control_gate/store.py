@@ -18,7 +18,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .model import Constraint, DeviceLimit, Fence, Mapping, State, fresh
+from .model import Constraint, DeviceLimit, Fence, FenceCause, Mapping, State, fresh
 
 SCHEMA_VERSION = 1
 
@@ -50,6 +50,20 @@ def _constraint(d) -> Constraint | None:
         return None
     return Constraint(Fence(d["fence"][0], int(d["fence"][1])), int(d["revision"]), d["controller_id"], d["controller_site"],
                       tuple(DeviceLimit(x[0], None if x[1] is None else float(x[1]), bool(x[2]), x[3]) for x in d["devices"]))
+
+
+def _cause_json(c: FenceCause | None):
+    if c is None:
+        return None
+    return {"kind": c.kind, "fence": [c.fence.term, c.fence.generation], "requested_by": c.requested_by,
+            "assignment_id": c.assignment_id, "assignment_revision": c.assignment_revision, "reason": c.reason}
+
+
+def _cause(d) -> FenceCause | None:
+    if d is None:
+        return None
+    return FenceCause(d["kind"], Fence(d["fence"][0], int(d["fence"][1])), d["requested_by"], d["assignment_id"],
+                      int(d["assignment_revision"]), d["reason"])
 
 
 def _mapping(d: dict) -> Mapping:
@@ -95,7 +109,9 @@ class Store:
                        # The plant domain (crowsnest-dev#270). Absent in a store written before it: the defaults,
                        # never a new term -- a schema bump would reinitialise the gate.
                        plant_generation=int(d.get("plant_generation", 1)), engineer_token=str(d.get("engineer_token", "")),
-                       constraint=_constraint(d.get("constraint")))
+                       constraint=_constraint(d.get("constraint")),
+                       # Why it last fenced alone (#290); absent in an older store, never a new term.
+                       last_cause=_cause(d.get("last_cause")))
         except (ValueError, KeyError, TypeError) as e:
             return fresh(vessel_id, now_ms), f"the stored state is inconsistent: {e}"
         if len(st.term) != 32:
@@ -107,7 +123,8 @@ class Store:
                            "mappings": [_mapping_json(m) for m in st.mappings], "station": st.station,
                            "in_transition": st.in_transition, "transition_reason": st.transition_reason,
                            "plant_generation": st.plant_generation, "engineer_token": st.engineer_token,
-                           "constraint": _constraint_json(st.constraint)})
+                           "constraint": _constraint_json(st.constraint),
+                           "last_cause": _cause_json(st.last_cause)})
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self.db.executemany("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
