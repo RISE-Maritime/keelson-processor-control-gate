@@ -46,6 +46,14 @@ sample has to pass the gate's own test before it reaches actuation.
   a stop or the lockout, the gate emits nothing at all. In the transition state it emits the
   configured value, never an implicit "nobody". A commit forgets every sample accepted under the old
   authority.
+- **ACTUATION_ALLOWED ⇒ maintenance_state INACTIVE (crowsnest-dev#302).** Any other state of the
+  procedure inhibits every DOF, with a reason that names it ("maintenance_state is PREPARING: …"). So do
+  a record older than `maintenance_ttl_ms` (15 s: three of the manager's heartbeats) and an unheard one:
+  a silent manager is not an INACTIVE one. The record is stamped on local receipt, never read from storage
+  at boot, and not persisted. It binds whatever `require_safety_state` says. `require_maintenance_state:
+  false` is only for a rig where nothing publishes it. On an SDK without `MaintenanceState` (the pin,
+  `0.6.0.dev21`: keelson#377 is not in it), a gate that requires it refuses to start rather than inhibit
+  forever.
 - **The direct abort.** The NAVIGATIONAL or OVERALL assignee can abort automation directly. The gate
   verifies them on its own projection of `command_assignment` and the session records: the assignee,
   the current revision, and that assignment's session token.
@@ -114,6 +122,7 @@ sample has to pass the gate's own test before it reaches actuation.
 | hears `command_authority/{vessel}` and `…/{vessel}/{overall,navigational}/session` | the holder's lease and the sessions, stamped on local receipt |
 | hears `command_assignment/{vessel}` | its own projection, for the direct abort |
 | hears `safety_state/{vessel}` | ACTUATION_ALLOWED |
+| hears `maintenance_state/{vessel}` | ACTUATION_ALLOWED: INACTIVE and fresh, or every DOF INHIBITED |
 | hears `control_candidate/**` and `guidance_candidate/**` | the helm's and the navigator's proposals, per DOF |
 | hears `command_authority/{vessel}/navigation` | the navigation authority document, for DECISION |
 | hears `navigation_state/**` | each producer's human order in force, for HUMAN_ORDER, stamped on local receipt |
@@ -161,6 +170,5 @@ also needs the manager's maintenance PR (#377).
 - **The rest of the §3.2 watchdogs:** `CONTROL_LINK_HEALTH`, `CONTROLLER_SUPERVISION_CHANNEL_HEALTH`,
   payload-gate liveliness, supervisor liveliness in `operational`, and
   `on_safety_supervisor_loss_while_active`.
-- **`maintenance_state`** (no subject yet) and **the lifecycle** in ACTUATION_ALLOWED. Arm-path
-  refusals for the legacy interfaces.
+- **The lifecycle** in ACTUATION_ALLOWED. Arm-path refusals for the legacy interfaces.
 - **Accepting stored control-plane state** only under the current fence and a newer `revision`.

@@ -62,7 +62,9 @@ class Helm:
 
 
 def clear(g):
+    """Cleared to move: the supervisor CLEAR and no maintenance procedure in force (#302)."""
     g.observe_safety(model.SAFETY_CLEAR, False)
+    g.observe_maintenance(model.MAINTENANCE_INACTIVE)
 
 
 def lease(g, holder=TED, token=TOKEN, ttl=2000):

@@ -149,6 +149,10 @@ class Gate:
         with self.lock:
             self.state = model.observe_safety(self.state, state, local_lockout, self.now_ms())
 
+    def observe_maintenance(self, state):
+        with self.lock:
+            self.state = model.observe_maintenance(self.state, state, self.now_ms())
+
     def sample(self, s: Sample) -> tuple[bool, str]:
         with self.lock:
             self.state, ok, why = model.on_sample(self.state, self.policy, s, self.now_ms())

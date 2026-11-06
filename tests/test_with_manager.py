@@ -75,6 +75,7 @@ def pair(tmp_path):
                 vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
     gate.boot()
     gate.observe_safety(g.SAFETY_CLEAR, False)
+    gate.observe_maintenance(g.MAINTENANCE_INACTIVE)
     bus = Bus()
     bus.gate = gate
     mgr = Manager(store=ManagerStore(tmp_path / "authority.sqlite"), policy=manager_policy({"dofs": DOFS}), vessel_id=V,
@@ -117,6 +118,7 @@ def test_the_manager_restarts_and_reconciles_with_a_gate_that_fenced_alone(pair,
     mgr.store.close()
     clock.t += 2001  # the manager is dead: nobody renews the conn
     gate.observe_safety(g.SAFETY_CLEAR, False)
+    gate.observe_maintenance(g.MAINTENANCE_INACTIVE)
     gate.cycle()
     assert gate.state.in_transition
     mgr2 = Manager(store=ManagerStore(tmp_path / "authority.sqlite"), policy=manager_policy({"dofs": DOFS}), vessel_id=V,
@@ -151,6 +153,7 @@ def plant(tmp_path):
                 vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
     gate.boot()
     gate.observe_safety(g.SAFETY_CLEAR, False)
+    gate.observe_maintenance(g.MAINTENANCE_INACTIVE)
     bus = AllLeases()
     bus.gate = gate
     mgr = Manager(store=ManagerStore(tmp_path / "authority.sqlite"), policy=manager_policy({"dofs": DOFS}), vessel_id=V,
@@ -213,6 +216,7 @@ def test_an_abort_the_gate_ran_alone_is_completed_by_the_manager_at_reconcile(tm
                 vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
     gate.boot()
     gate.observe_safety(g.SAFETY_CLEAR, False)
+    gate.observe_maintenance(g.MAINTENANCE_INACTIVE)
     bus = AllLeases()
     bus.gate = gate
     pol = manager_policy({"dofs": DOFS, "automation_sources": ["navigation/0"], "processes": ["navigation/0@usv-alpha"]})

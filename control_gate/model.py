@@ -39,6 +39,12 @@ OVERALL, NAVIGATIONAL = "overall", "navigational"
 # keelson.SafetyState.State
 SAFETY_CLEAR = 1
 
+# keelson.MaintenanceState.State (keelson#377): only INACTIVE lets her move. The names are for the reason a
+# DOF is INHIBITED, so an operator reads which step of the procedure is holding her.
+MAINTENANCE_INACTIVE = 1
+MAINTENANCE_STATES = {0: "UNSPECIFIED", 1: "INACTIVE", 2: "REQUESTED", 3: "PREPARING", 4: "MAINTENANCE",
+                      5: "READY_FOR_CHECK"}
+
 ACTIVE, STALE, TRANSITION, INHIBITED, UNMAPPED = "ACTIVE", "STALE", "TRANSITION", "INHIBITED", "UNMAPPED"
 
 
@@ -166,6 +172,15 @@ class SafetySeen:
 
 
 @dataclass(frozen=True)
+class MaintenanceSeen:
+    """The manager's `maintenance_state/{vessel}`, stamped on LOCAL receipt: the manager republishes it at its
+    heartbeat, so a silent manager reads as stale here, never as a standing INACTIVE (crowsnest-dev#302)."""
+
+    state: int
+    heard_ms: int
+
+
+@dataclass(frozen=True)
 class Stream:
     stream_id: str
     last_sequence: int
@@ -275,6 +290,7 @@ class State:
     assignments: dict = field(default_factory=dict)  # role -> AssignmentSeen
     feed: Heard | None = None  # the command_assignment feed: holder = issuer, ttl = feed_ttl
     safety: SafetySeen | None = None
+    maintenance: MaintenanceSeen | None = None  # volatile like `safety`: a restarted gate waits to hear it
     streams: dict = field(default_factory=dict)  # source -> Stream
     latest: dict = field(default_factory=dict)  # (source, dof) -> Sample, every ordered sample heard
     accepted: dict = field(default_factory=dict)  # dof -> Sample that passed the test
@@ -312,6 +328,10 @@ class Policy:
     transition_values: dict = field(default_factory=dict)  # dof -> value in the transition state
     safety_ttl_ms: int = 15000  # the supervisor republishes at 5 s
     require_safety_state: bool = True  # False only in a test rig with no supervisor, and labelled so
+    maintenance_ttl_ms: int = 15000  # the manager republishes at 5 s
+    # False only where nothing can publish it -- an SDK without MaintenanceState (keelson#377), a rig with
+    # no manager -- and then the bin says so. True and unreadable is a gate that refuses to start.
+    require_maintenance_state: bool = True
     lease_grace_ms: int = 5000  # after boot, before an unheard holder's lease counts as lapsed
     groups: dict = field(default_factory=dict)  # group_id -> dofs that move together (ResolvedControl)
     propulsion: dict = field(default_factory=dict)  # dof -> the platform's propulsion[].id it drives
@@ -509,21 +529,34 @@ def observe_safety(st: State, state: int, local_lockout: bool, now_ms: int) -> S
     return replace(st, safety=SafetySeen(state, local_lockout, now_ms))
 
 
+def observe_maintenance(st: State, state: int, now_ms: int) -> State:
+    return replace(st, maintenance=MaintenanceSeen(int(state), now_ms))
+
+
 def actuation_allowed(st: State, pol: Policy, now_ms: int) -> tuple[bool, str]:
-    """I6: ACTUATION_ALLOWED ⇒ SafetyState CLEAR ∧ ¬local_lockout (∧ maintenance INACTIVE ∧ the lifecycle
-    permits -- neither has a subject yet, so neither can refuse here). A silent supervisor is not a
-    CLEAR one."""
+    """I6: ACTUATION_ALLOWED ⇒ SafetyState CLEAR ∧ ¬local_lockout ∧ maintenance INACTIVE (∧ the lifecycle
+    permits -- it has no subject yet, so it cannot refuse here). A silent supervisor is not a CLEAR one,
+    and a silent manager is not an INACTIVE one: an unheard or stale maintenance_state is not INACTIVE
+    (keelson protocols/maintenance.yaml)."""
     s = st.safety
     if s is not None and s.local_lockout:
         return False, "local lockout: remote operation inhibited"
-    if not pol.require_safety_state:
-        return True, ""  # a rig with no supervisor, by policy; the lockout above still binds
-    if s is None:
-        return False, "no safety_state heard"
-    if now_ms - s.heard_ms > pol.safety_ttl_ms:
-        return False, "safety_state is stale"
-    if s.state != SAFETY_CLEAR:
-        return False, "the vessel is not CLEAR"
+    if pol.require_safety_state:  # off only in a rig with no supervisor, by policy; the lockout still binds
+        if s is None:
+            return False, "no safety_state heard"
+        if now_ms - s.heard_ms > pol.safety_ttl_ms:
+            return False, "safety_state is stale"
+        if s.state != SAFETY_CLEAR:
+            return False, "the vessel is not CLEAR"
+    if pol.require_maintenance_state:
+        m = st.maintenance
+        if m is None:
+            return False, "no maintenance_state heard"
+        if now_ms - m.heard_ms > pol.maintenance_ttl_ms:
+            return False, "maintenance_state is stale"
+        if m.state != MAINTENANCE_INACTIVE:
+            name = MAINTENANCE_STATES.get(m.state, f"state {m.state}")
+            return False, f"maintenance_state is {name}: actuation inhibited until it is INACTIVE"
     return True, ""
 
 

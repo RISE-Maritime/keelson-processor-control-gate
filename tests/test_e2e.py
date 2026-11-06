@@ -57,7 +57,10 @@ class Harness:
         self.session.put(f"{BASE}/{path}", keelson.enclose(msg.SerializeToString()))
 
     def clear(self):
+        from keelson.payloads.MaintenanceState_pb2 import MaintenanceState
+
         self.put(f"safety_state/{V}", SafetyState(vessel_id=V, state=SafetyState.State.SAFETY_STATE_CLEAR))
+        self.put(f"maintenance_state/{V}", MaintenanceState(vessel_id=V, state=MaintenanceState.State.STATE_INACTIVE))
 
     def start_gate(self, **extra):
         policy = self.tmp / "gate-policy.json"
@@ -324,3 +327,61 @@ def test_i16_an_engineer_handover_on_the_bus_never_lets_the_derate_slip(h):
         stop.set()
         for s in subs:
             s.undeclare()
+
+
+def test_maintenance_on_the_bus_inhibits_every_dof_and_inactive_releases_it(h):
+    """#302: the manager's maintenance_state reaches the gate; anything but INACTIVE inhibits, and says so."""
+    from keelson.payloads.MaintenanceState_pb2 import MaintenanceState
+    from keelson.payloads.ResolvedControl_pb2 import ResolvedControl
+
+    resolved = []
+    sub = h.session.declare_subscriber(f"{BASE}/resolved_control/{V}", lambda s: resolved.append(_dec(s, ResolvedControl)))
+    try:
+        h.start_gate()
+        h.put(f"safety_state/{V}", SafetyState(vessel_id=V, state=SafetyState.State.SAFETY_STATE_CLEAR))
+        h.wait(lambda: resolved and "no maintenance_state heard" in resolved[-1].actuation_reason, what="the unheard record named")
+        h.put(f"maintenance_state/{V}", MaintenanceState(vessel_id=V, state=MaintenanceState.State.STATE_MAINTENANCE))
+        h.wait(lambda: "maintenance_state is MAINTENANCE" in resolved[-1].actuation_reason, what="MAINTENANCE named")
+        assert not resolved[-1].actuation_allowed
+        h.put(f"maintenance_state/{V}", MaintenanceState(vessel_id=V, state=MaintenanceState.State.STATE_INACTIVE))
+        h.wait(lambda: resolved[-1].actuation_allowed, what="INACTIVE to allow actuation")
+    finally:
+        sub.undeclare()
+
+
+# A keelson SDK without MaintenanceState, as the pin (0.6.0.dev21) is: the one module made unimportable.
+_NO_MAINTENANCE = '''
+import importlib.abc, sys
+class _Block(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "keelson.payloads.MaintenanceState_pb2":
+            raise ImportError("this SDK predates MaintenanceState")
+sys.meta_path.insert(0, _Block())
+'''
+
+
+@pytest.mark.parametrize("required", [True, False])
+def test_on_an_sdk_without_maintenance_state_the_gate_refuses_to_start_unless_told_not_to(h, tmp_path, required):
+    import os
+
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(_NO_MAINTENANCE)
+    policy = tmp_path / "p.json"
+    policy.write_text(json.dumps({"dofs": DOFS, "require_maintenance_state": required}))
+    env = {**os.environ, "PYTHONPATH": str(site)}
+    p = subprocess.Popen([sys.executable, str(ROOT / "bin/control-gate2keelson.py"), "--state-dir", str(tmp_path / "s"),
+                          "--policy", str(policy), "-r", REALM, "-e", V, "--zenoh-config", str(h.zcfg)],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    try:
+        if required:
+            out = p.communicate(timeout=20)[0]
+            assert p.returncode == 2 and "no MaintenanceState" in out
+        else:
+            token = keelson.construct_source_liveliness_key(REALM, V, "control-gate")
+            h.wait(lambda: p.poll() is None and any(True for _ in h.session.liveliness().get(token, timeout=0.5)),
+                   what="the gate to start with the requirement off")
+    finally:
+        if p.poll() is None:
+            p.terminate()
+            p.communicate(timeout=10)

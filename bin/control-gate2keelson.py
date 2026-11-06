@@ -6,7 +6,8 @@ not performance. It serves `control_gate/v1` to the authority manager (and `abor
 assignee when the manager is unhealthy), and it hears:
 - `command_authority` -- the conn lease and the assignment sessions, stamped on local receipt;
 - `command_assignment` -- its own projection, for the direct abort;
-- `safety_state` -- ACTUATION_ALLOWED.
+- `safety_state` and `maintenance_state` -- ACTUATION_ALLOWED. A gate that must read the second and
+  cannot (an SDK without MaintenanceState, keelson#377) refuses to start rather than inhibit forever.
 
 It hears the candidates -- `control_candidate/**` (a station's helm) and `guidance_candidate/**` (the
 navigator, checked for DECISION and EXECUTION, I15) -- and the navigation authority document, and
@@ -74,6 +75,15 @@ def _decode_timed(sample, cls):
     return msg, received_ns, enclosed_ns
 
 
+def _maintenance_pb():
+    """keelson.MaintenanceState, or None on an SDK that predates it (keelson#377 is not in the pin)."""
+    try:
+        from keelson.payloads.MaintenanceState_pb2 import MaintenanceState  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        return None
+    return MaintenanceState
+
+
 def main() -> int:
     args = build_parser().parse_args()
     setup_logging(level=args.log_level)
@@ -83,6 +93,14 @@ def main() -> int:
     policy = load(args.policy)
     if not policy.require_safety_state:
         log.warning("require_safety_state is OFF: a rig with no supervisor. Never on a vessel.")
+    maintenance_pb = _maintenance_pb()
+    if policy.require_maintenance_state and maintenance_pb is None:
+        log.error("require_maintenance_state is on, and this keelson SDK has no MaintenanceState (keelson#377): "
+                  "the gate could never allow actuation. Install an SDK that carries it, or set "
+                  "require_maintenance_state false in a rig with no manager.")
+        return 2
+    if not policy.require_maintenance_state:
+        log.warning("require_maintenance_state is OFF: a rig with no maintenance_state. Never on a vessel.")
 
     conf = create_zenoh_config(args.mode, args.connect, args.listen, zenoh_config=args.zenoh_config)
     with zenoh.open(conf) as session:
@@ -114,6 +132,9 @@ def main() -> int:
         def on_safety(sample):
             s = _decode(sample, SafetyState)
             gate.observe_safety(int(s.state), bool(s.local_lockout))
+
+        def on_maintenance(sample):
+            gate.observe_maintenance(int(_decode(sample, maintenance_pb).state))
 
         def on_constraint(sample):
             gate.observe_constraint(codec.constraint_from_proto(_decode(sample, PropulsionConstraint)))
@@ -152,6 +173,10 @@ def main() -> int:
             session.declare_subscriber(f"{base}/command_authority/**", guarded(on_authority)),
             session.declare_subscriber(f"{base}/command_assignment/{vessel}", guarded(on_assignment)),
             session.declare_subscriber(f"{base}/safety_state/{vessel}", guarded(on_safety)),
+            # Live only, never read from storage at boot: a stored INACTIVE says nothing about a live
+            # manager, and its heartbeat (5 s) arrives inside the lease grace anyway.
+            *([session.declare_subscriber(f"{base}/maintenance_state/{vessel}", guarded(on_maintenance))]
+              if maintenance_pb is not None else []),
             session.declare_subscriber(f"{base}/propulsion_constraint/{vessel}", guarded(on_constraint)),
         ]
         # Stored: a constraint written while this gate was down is still the one in force.

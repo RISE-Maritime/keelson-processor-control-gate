@@ -8,5 +8,7 @@
   "transition": {"name": "neutral", "values": {"rudder": 0, "throttle_port": 0, "throttle_stbd": 0}},
   "safety_ttl_ms": 15000,
   "require_safety_state": true,
+  "maintenance_ttl_ms": 15000,
+  "require_maintenance_state": true,
   "lease_grace_ms": 5000
 }
