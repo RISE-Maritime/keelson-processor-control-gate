@@ -120,3 +120,80 @@ def test_the_manager_restarts_and_reconciles_with_a_gate_that_fenced_alone(pair,
                    gate=InProcess(gate), publish=Bus(), now_ms=clock)
     mgr2.boot()
     assert mgr2.state.in_force.fence == m.Fence(gate.state.term, gate.state.generation) and mgr2.state.in_force.mappings == ()
+
+
+# ---------------------------------------------------------------------------- crowsnest-dev#270: the plant and the payload
+
+
+class AllLeases(Bus):
+    """Every lease the manager publishes, to the gate as bin/ delivers it (conn, engineer, payload)."""
+
+    def __call__(self, effect, st):
+        if isinstance(effect, m.PublishLease) and self.gate is not None:
+            lease = effect.lease if effect.released else st.leases.get(effect.slot)
+            self.gate.observe_lease(effect.slot, lease.holder, lease.token, lease.ttl_ms, effect.released, lease.site)
+
+
+def _heard(c):
+    """The gate's rebased constraint, as the manager hears it on propulsion_constraint."""
+    return m.HeardConstraint(m.Fence(c.fence.term, c.fence.generation), c.revision, c.controller_id,
+                             tuple((d.device_id, d.max_power_pct, d.inhibit, d.reason) for d in c.devices))
+
+
+@pytest.fixture
+def plant(tmp_path):
+    clock = Clock()
+    gate = Gate(store=Store(tmp_path / "gate.sqlite"), policy=parse({"dofs": DOFS, "automation_sources": ["navigation/0"],
+                                                                     "propulsion": {"throttle": "stbd"}}),
+                vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
+    gate.boot()
+    gate.observe_safety(g.SAFETY_CLEAR, False)
+    bus = AllLeases()
+    bus.gate = gate
+    mgr = Manager(store=ManagerStore(tmp_path / "authority.sqlite"), policy=manager_policy({"dofs": DOFS}), vessel_id=V,
+                  gate=InProcess(gate), publish=bus, now_ms=clock)
+    mgr.boot()
+    helm(gate, clock, "ROC-1")
+    assert mgr.transfer(m.TransferRequest(m.GRANT, "ted@ROC-1", "ROC-1", mappings=rows("ROC-1"))).outcome == m.ACCEPTED
+    return mgr, gate, clock
+
+
+def test_i16_an_engineer_handover_through_the_manager_inherits_the_derate_and_power_stays_under_it(plant):
+    mgr, gate, clock = plant
+    assert mgr.take(m.ENGINEER, "anna@ECR", "ECR").outcome == m.ACCEPTED
+    n = gate.state.plant_generation
+    assert n == 2  # the gate minted for Anna's token
+    ok, why = gate.observe_constraint(g.Constraint(gate.state.plant_fence, 1, "anna@ECR", "ECR",
+                                                   (g.DeviceLimit("stbd", 40.0, reason="bearing temperature"),)))
+    assert ok, why
+    mgr.observe_constraint(_heard(gate.state.constraint))
+    assert mgr.state.leases[m.slot_of(m.ENGINEER)].fence == m.Fence(gate.state.term, n)
+    gate.sample(Sample("ROC-1/helm-1/throttle", "throttle", 80, "s1", 2, clock()))
+    out = [{r.dof: r.value for r in gate.cycle()}["throttle"]]
+
+    anna = mgr.state.leases[m.slot_of(m.ENGINEER)]
+    assert mgr.offer(m.ENGINEER, "anna@ECR", "", anna.token, "bo@ECR", "ECR").outcome == m.ACCEPTED
+    out.append({r.dof: r.value for r in gate.cycle()}["throttle"])
+    assert gate.state.plant_generation == n  # an offer moves nothing
+    d = mgr.take(m.ENGINEER, "bo@ECR", "ECR")
+    assert d.outcome == m.ACCEPTED and "inherits stbd 40 %" in d.detail
+    assert gate.state.plant_generation == n + 1  # the new token, observed
+    out.append({r.dof: r.value for r in gate.cycle()}["throttle"])
+    (rebased,) = gate.take_publications()
+    assert (rebased.revision, rebased.controller_id, rebased.devices) == (1, "bo@ECR", gate.state.constraint.devices)
+    mgr.observe_constraint(_heard(rebased))
+    assert mgr.state.leases[m.slot_of(m.ENGINEER)].fence == m.Fence(gate.state.term, n + 1)
+    assert out == [40, 40, 40]
+    assert gate.state.fence.generation == mgr.state.in_force.fence.generation  # the helm's fence never moved
+
+
+def test_a_payload_change_of_hands_fences_the_payload_and_not_the_helm(plant):
+    mgr, gate, clock = plant
+    motion, mapped = gate.state.fence, gate.state.mappings
+    mgr.take(m.PAYLOAD, "cy@ROC-1", "ROC-1", "gimbal")
+    cy = mgr.state.leases[m.slot_of(m.PAYLOAD, "gimbal")]
+    mgr.offer(m.PAYLOAD, "cy@ROC-1", "gimbal", cy.token, "bo@ECR", "ECR")
+    assert mgr.take(m.PAYLOAD, "bo@ECR", "ECR", "gimbal").outcome == m.ACCEPTED
+    gate.cycle()
+    assert gate.state.fence == motion and gate.state.mappings == mapped and not gate.state.in_transition
+    assert gate.state.plant_generation == 1

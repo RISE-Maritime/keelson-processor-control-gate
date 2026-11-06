@@ -17,6 +17,9 @@ def parse(d: dict) -> Policy:
     values = {str(k): float(v) for k, v in (transition.get("values") or {}).items()}
     if not set(values) <= set(dofs):
         raise ValueError("a transition value for a DOF the vessel does not have")
+    propulsion = {str(k): str(v) for k, v in (d.get("propulsion") or {}).items()}
+    if not set(propulsion) <= set(dofs):
+        raise ValueError("propulsion names a DOF the vessel does not have")
     return Policy(
         command_profile=d.get("command_profile", "test"),
         dofs=dofs,
@@ -31,6 +34,7 @@ def parse(d: dict) -> Policy:
         lease_grace_ms=int(d.get("lease_grace_ms", 5000)),
         groups={str(k): tuple(v) for k, v in (d.get("groups") or {}).items()},
         navigation_state_max_age_ms=int(d.get("navigation_state_max_age_ms", 3000)),
+        propulsion=propulsion,
     )
 
 

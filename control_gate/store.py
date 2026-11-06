@@ -18,7 +18,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .model import Fence, Mapping, State, fresh
+from .model import Constraint, DeviceLimit, Fence, Mapping, State, fresh
 
 SCHEMA_VERSION = 1
 
@@ -35,6 +35,21 @@ def _mapping_json(m: Mapping) -> dict:
     return {"dof": m.dof, "authority_holder": m.authority_holder, "authority_lease_id": m.authority_lease_id,
             "execution_source": m.execution_source, "envelope": list(m.envelope), "group_id": m.group_id,
             "mapping_id": m.mapping_id, "fence": None if m.fence is None else [m.fence.term, m.fence.generation]}
+
+
+def _constraint_json(c: Constraint | None):
+    if c is None:
+        return None
+    return {"fence": [c.fence.term, c.fence.generation], "revision": c.revision, "controller_id": c.controller_id,
+            "controller_site": c.controller_site,
+            "devices": [[d.device_id, d.max_power_pct, d.inhibit, d.reason] for d in c.devices]}
+
+
+def _constraint(d) -> Constraint | None:
+    if d is None:
+        return None
+    return Constraint(Fence(d["fence"][0], int(d["fence"][1])), int(d["revision"]), d["controller_id"], d["controller_site"],
+                      tuple(DeviceLimit(x[0], None if x[1] is None else float(x[1]), bool(x[2]), x[3]) for x in d["devices"]))
 
 
 def _mapping(d: dict) -> Mapping:
@@ -76,7 +91,11 @@ class Store:
                 return fresh(vessel_id, now_ms), f"the store is for vessel {d['vessel_id']!r}"
             st = State(vessel_id=vessel_id, term=d["term"], generation=int(d["generation"]),
                        mappings=tuple(_mapping(m) for m in d["mappings"]), station=d["station"],
-                       in_transition=bool(d["in_transition"]), transition_reason=d["transition_reason"], boot_ms=now_ms)
+                       in_transition=bool(d["in_transition"]), transition_reason=d["transition_reason"], boot_ms=now_ms,
+                       # The plant domain (crowsnest-dev#270). Absent in a store written before it: the defaults,
+                       # never a new term -- a schema bump would reinitialise the gate.
+                       plant_generation=int(d.get("plant_generation", 1)), engineer_token=str(d.get("engineer_token", "")),
+                       constraint=_constraint(d.get("constraint")))
         except (ValueError, KeyError, TypeError) as e:
             return fresh(vessel_id, now_ms), f"the stored state is inconsistent: {e}"
         if len(st.term) != 32:
@@ -86,7 +105,9 @@ class Store:
     def save(self, st: State) -> None:
         body = _canonical({"vessel_id": st.vessel_id, "term": st.term, "generation": st.generation,
                            "mappings": [_mapping_json(m) for m in st.mappings], "station": st.station,
-                           "in_transition": st.in_transition, "transition_reason": st.transition_reason})
+                           "in_transition": st.in_transition, "transition_reason": st.transition_reason,
+                           "plant_generation": st.plant_generation, "engineer_token": st.engineer_token,
+                           "constraint": _constraint_json(st.constraint)})
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self.db.executemany("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",

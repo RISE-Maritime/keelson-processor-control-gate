@@ -7,6 +7,7 @@ from keelson.interfaces.ControlGate_pb2 import AbortAutomationResponse, CommitRe
 from keelson.interfaces.VehicleCommon_pb2 import CommandResult
 from keelson.payloads.ControlMapping_pb2 import ControlMapping, TransferAck, TransferKind
 from keelson.payloads.Fence_pb2 import Fence as PbFence
+from keelson.payloads.PropulsionConstraint_pb2 import PropulsionConstraint
 
 from . import model
 from .model import DirectAbort, Fence, Mapping, Proposal
@@ -17,6 +18,27 @@ KIND = {
     TransferKind.TRANSFER_KIND_STATION_HANDOVER: model.STATION_HANDOVER,
     TransferKind.TRANSFER_KIND_ABORT_AUTOMATION: model.ABORT_AUTOMATION,
 }
+
+
+def constraint_from_proto(pb) -> model.Constraint | None:
+    """A `PropulsionConstraint`, or None when it carries no fence (never applied)."""
+    fence = fence_from_proto(pb.fence) if pb.HasField("fence") else None
+    if fence is None:
+        return None
+    devices = tuple(model.DeviceLimit(d.device_id, d.max_power_pct if d.HasField("max_power_pct") else None, bool(d.inhibit),
+                                      d.reason) for d in pb.devices)
+    return model.Constraint(fence, int(pb.revision), pb.controller_id, pb.controller_site, devices)
+
+
+def constraint_to_proto(c: model.Constraint, vessel_id: str, ts) -> PropulsionConstraint:
+    out = PropulsionConstraint(vessel_id=vessel_id, controller_id=c.controller_id, controller_site=c.controller_site,
+                               fence=fence_to_proto(c.fence), revision=c.revision)
+    out.timestamp.CopyFrom(ts)
+    for d in c.devices:
+        dc = out.devices.add(device_id=d.device_id, inhibit=d.inhibit, reason=d.reason)
+        if d.max_power_pct is not None:
+            dc.max_power_pct = d.max_power_pct
+    return out
 
 
 def fence_to_proto(f: Fence) -> PbFence:

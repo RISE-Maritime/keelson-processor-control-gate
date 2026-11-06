@@ -53,6 +53,7 @@ class Gate:
         self.sequence = 0  # ResolvedControl's, per incarnation of this process
         self.group_sequences: dict[str, int] = {}
         self.last_cycle: Cycle | None = None
+        self.outbox: list = []  # plant constraints the gate rebased, for bin/ to publish (take_publications)
 
     def boot(self) -> model.State:
         with self.lock:
@@ -102,9 +103,39 @@ class Gate:
 
     # ------------------------------------------------------------------ what the gate hears
 
-    def observe_lease(self, slot, holder, token, ttl_ms, released):
+    def observe_lease(self, slot, holder, token, ttl_ms, released, site=""):
         with self.lock:
-            self.state = model.observe_lease(self.state, slot, holder, token, ttl_ms, released, self.now_ms())
+            before = self.state.plant_generation
+            st = model.observe_lease(self.state, slot, holder, token, ttl_ms, released, self.now_ms(), site)
+            if st.plant_generation != before:
+                # A new ENGINEER holder: the generation and the rebased constraint are durable before
+                # anything is published or clamped under them.
+                self.store.save(st)
+                self.events.append(f"plant_generation {st.plant_generation} for {holder}")
+                log.warning("NEW ENGINEER %s: plant_generation %d%s", holder, st.plant_generation,
+                            "; the constraint in force is inherited at revision 1" if st.constraint else "")
+                if st.constraint is not None:
+                    self.outbox.append(st.constraint)
+            self.state = st
+
+    def observe_constraint(self, c: model.Constraint | None) -> tuple[bool, str]:
+        with self.lock:
+            if c is None:
+                return False, "no fence"
+            st, ok, why = model.observe_constraint(self.state, c, self.now_ms())
+            if ok:
+                self.store.save(st)
+                log.info("propulsion_constraint revision %d by %s: %s", c.revision, c.controller_id,
+                         ", ".join(f"{d.device_id} {'inhibited' if d.inhibit else d.max_power_pct}" for d in c.devices) or "none")
+            else:
+                log.info("propulsion_constraint revision %d by %s dropped: %s", c.revision, c.controller_id, why)
+            self.state = st
+            return ok, why
+
+    def take_publications(self) -> list:
+        with self.lock:
+            out, self.outbox = self.outbox, []
+            return out
 
     def observe_session(self, role, holder, token, assignment_id, ttl_ms, released):
         with self.lock:

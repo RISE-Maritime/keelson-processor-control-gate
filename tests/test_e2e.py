@@ -59,9 +59,9 @@ class Harness:
     def clear(self):
         self.put(f"safety_state/{V}", SafetyState(vessel_id=V, state=SafetyState.State.SAFETY_STATE_CLEAR))
 
-    def start_gate(self):
+    def start_gate(self, **extra):
         policy = self.tmp / "gate-policy.json"
-        policy.write_text(json.dumps({"dofs": DOFS, "automation_sources": ["navigation/0"]}))
+        policy.write_text(json.dumps({"dofs": DOFS, "automation_sources": ["navigation/0"], **extra}))
         self._spawn("gate", [str(ROOT / "bin/control-gate2keelson.py"), "--state-dir", str(self.tmp / "gate-state"),
                              "--policy", str(policy)], "control-gate")
 
@@ -245,3 +245,82 @@ def _dec(sample, cls):
     msg = cls()
     msg.ParseFromString(keelson.uncover(sample.payload.to_bytes())[2])
     return msg
+
+
+def test_i16_an_engineer_handover_on_the_bus_never_lets_the_derate_slip(h):
+    """crowsnest-dev#270: the conn drives the starboard throttle at 80 %, the engineer derates it to 40 %,
+    and a new ENGINEER lease on the bus mints the next plant_generation here; the gate publishes the
+    inherited constraint at revision 1, and no ResolvedControl after the derate shows more than 40 %."""
+    import threading
+
+    from keelson.payloads.ControlCandidate_pb2 import ControlCandidate
+    from keelson.payloads.Fence_pb2 import Fence as PbFence
+    from keelson.payloads.GuidanceCandidate_pb2 import CandidateStream
+    from keelson.payloads.PropulsionConstraint_pb2 import PropulsionConstraint
+    from keelson.payloads.ResolvedControl_pb2 import ResolvedControl
+
+    resolved, constraints = [], []
+    subs = [h.session.declare_subscriber(f"{BASE}/resolved_control/{V}", lambda s: resolved.append(_dec(s, ResolvedControl))),
+            h.session.declare_subscriber(f"{BASE}/propulsion_constraint/{V}",
+                                         lambda s: constraints.append(_dec(s, PropulsionConstraint)))]
+    stop = threading.Event()
+    seq = {"n": 0}
+
+    def helm(dof, value):
+        seq["n"] += 1
+        h.put(f"control_candidate/helm-1/{dof}", ControlCandidate(source=f"ROC-1/helm-1/{dof}", dof=dof, value_pct=value,
+                                                                  stream=CandidateStream(stream_id="s1", sequence=seq["n"])))
+
+    def driving():
+        while not stop.is_set():
+            helm("throttle", 80)
+            time.sleep(0.05)
+
+    def engineer(who, token):
+        h.put(f"command_authority/{V}/engineer", CommandAuthority(vessel_id=V, controller_id=who, controller_site="ECR", token=token,
+                                                                  lease_ttl_seconds=60, role=Role.ROLE_ENGINEER))
+
+    def throttle(rc):
+        return next(d for d in rc.dofs if d.dof == "throttle")
+
+    try:
+        h.start_gate(propulsion={"throttle": "stbd"})
+        h.clear()
+        h.put(f"command_authority/{V}", CommandAuthority(vessel_id=V, controller_id="ted@ROC-1", token="tok", lease_ttl_seconds=60,
+                                                         role=Role.ROLE_CONN))
+        for d in DOFS:
+            helm(d, 0)
+        time.sleep(0.3)
+        rows = [ControlMapping(dof=d, mapping_id=d, authority_holder="ted@ROC-1", authority_lease_id="tok",
+                               execution_source=f"ROC-1/helm-1/{d}") for d in DOFS]
+        ack = h.gate("prepare", TransferPrepare(transfer_id="g1", vessel_id=V, kind=TransferKind.TRANSFER_KIND_GRANT, mappings=rows,
+                                                active_control_station="ROC-1", prepare_ttl_ms=2000), TransferAck)
+        assert ack.accepted, ack.reason
+        assert h.gate("commit", TransferCommit(transfer_id="g1", fence=ack.proposed_fence), CommitResponse).applied
+        threading.Thread(target=driving, daemon=True).start()
+        h.wait(lambda: resolved and throttle(resolved[-1]).accepted_pct == 80, what="the throttle at 80 %")
+
+        engineer("anna@ECR", "eng-anna")  # the gate mints plant_generation 2 for her
+        term = ack.proposed_fence.term
+        time.sleep(0.5)
+        h.put(f"propulsion_constraint/{V}", PropulsionConstraint(
+            vessel_id=V, controller_id="anna@ECR", controller_site="ECR", fence=PbFence(term=term, generation=2), revision=1,
+            devices=[PropulsionConstraint.DeviceConstraint(device_id="stbd", max_power_pct=40, reason="bearing temperature")]))
+        h.wait(lambda: throttle(resolved[-1]).accepted_pct == 40, what="the derate to clamp the throttle")
+        derated_from = len(resolved) - 1
+
+        engineer("bo@ECR", "eng-bo")  # the handover: a token the gate has not seen
+        h.wait(lambda: any(c.controller_id == "bo@ECR" for c in constraints), what="the inherited constraint at revision 1")
+        c = next(c for c in constraints if c.controller_id == "bo@ECR")
+        assert (c.fence.term, c.fence.generation, c.revision) == (term, 3, 1)
+        assert [(d.device_id, d.max_power_pct) for d in c.devices] == [("stbd", 40)]
+        # Anna, after the handover, under her generation: dropped.
+        h.put(f"propulsion_constraint/{V}", PropulsionConstraint(
+            vessel_id=V, controller_id="anna@ECR", fence=PbFence(term=term, generation=2), revision=2))
+        time.sleep(1.0)
+        after = [throttle(rc).accepted_pct for rc in resolved[derated_from:] if throttle(rc).HasField("accepted_pct")]
+        assert after and max(after) <= 40
+    finally:
+        stop.set()
+        for s in subs:
+            s.undeclare()

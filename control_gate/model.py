@@ -10,6 +10,14 @@ THE GATE IS THE ENFORCER. Every candidate sample reaches actuation only through 
 
     fresh ∧ ordered ∧ authorised ∧ fenced ∧ sourced ∧ enveloped ∧ permitted
 
+IT MINTS `plant_generation` AND CLAMPS BY THE PLANT CONSTRAINT (§1.1, I16; crowsnest-dev#270). The
+authority manager authorises a change of ENGINEER holder by publishing the new holder's lease; a token
+this gate has not seen is that change, and the gate mints the next generation under its own term
+(`observe_lease`). In the same step it REBASES the constraint in force -- the same devices, revision 1,
+the new fence -- so a change of engineer can never relax it. A constraint record is applied only under
+the current plant fence, at a newer revision, from the live ENGINEER holder (`observe_constraint`), and
+every resolved value of a propulsion DOF is clamped by it (`resolve`). Silence never lifts it.
+
 IT OWNS BOTH HALVES OF THE MOTION FENCE. The term is a random 128-bit value drawn when the store is
 (re)initialised and never otherwise. The generation is reserved here on an ACK (`prepare`), made
 current only on COMMIT (`commit`), and incremented here ALONE when authority must change with no
@@ -57,6 +65,30 @@ class Mapping:
     group_id: str = ""
     mapping_id: str = ""
     fence: Fence | None = None
+
+
+@dataclass(frozen=True)
+class DeviceLimit:
+    """One `PropulsionConstraint.DeviceConstraint`. `max_power_pct` None is no cap (never 0)."""
+
+    device_id: str
+    max_power_pct: float | None = None
+    inhibit: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class Constraint:
+    """The plant constraint in force (`propulsion_constraint/{vessel}`), under `plant_generation`."""
+
+    fence: Fence
+    revision: int
+    controller_id: str
+    controller_site: str = ""
+    devices: tuple[DeviceLimit, ...] = ()
+
+    def limit(self, device_id: str) -> DeviceLimit | None:
+        return next((d for d in self.devices if d.device_id == device_id), None)
 
 
 @dataclass(frozen=True)
@@ -212,6 +244,9 @@ class State:
     station: str = ""
     in_transition: bool = True  # a gate with no committed map is in its transition state
     transition_reason: str = "no map committed"
+    plant_generation: int = 1  # under the same term: the motion gate's (Fence.proto)
+    engineer_token: str = ""  # the ENGINEER token the current plant_generation belongs to
+    constraint: Constraint | None = None  # the plant constraint in force; never lifted by silence
     # ---- volatile: lost on restart by design (a reservation does not survive the gate, §4)
     reservation: Reservation | None = None
     boot_ms: int = 0
@@ -230,6 +265,10 @@ class State:
     @property
     def fence(self) -> Fence:
         return Fence(self.term, self.generation)
+
+    @property
+    def plant_fence(self) -> Fence:
+        return Fence(self.term, self.plant_generation)
 
     def mapping(self, dof: str) -> Mapping | None:
         return next((m for m in self.mappings if m.dof == dof), None)
@@ -255,6 +294,7 @@ class Policy:
     require_safety_state: bool = True  # False only in a test rig with no supervisor, and labelled so
     lease_grace_ms: int = 5000  # after boot, before an unheard holder's lease counts as lapsed
     groups: dict = field(default_factory=dict)  # group_id -> dofs that move together (ResolvedControl)
+    propulsion: dict = field(default_factory=dict)  # dof -> the platform's propulsion[].id it drives
     navigation_state_max_age_ms: int = 3000  # a HUMAN_ORDER is checked against a record this fresh
 
     def transition_value(self, dof: str) -> float:
@@ -361,13 +401,62 @@ def fence_alone(st: State, reason: str) -> State:
 # ---------------------------------------------------------------------------- observations
 
 
-def observe_lease(st: State, slot: str, holder: str, token: str, ttl_ms: int, released: bool, now_ms: int) -> State:
+def observe_lease(st: State, slot: str, holder: str, token: str, ttl_ms: int, released: bool, now_ms: int,
+                  site: str = "") -> State:
+    """A lease record. On the ENGINEER slot, a token this gate has not seen is a new holder the manager
+    authorised: the gate mints the next `plant_generation` and rebases the constraint in force onto it
+    (`_new_engineer`). A released or lapsed ENGINEER lease mints nothing and lifts nothing."""
     leases = dict(st.leases)
     if released:
         leases.pop(slot, None)
     else:
         leases[slot] = Heard(holder, token, ttl_ms, now_ms)
-    return replace(st, leases=leases)
+    st = replace(st, leases=leases)
+    if slot == "engineer" and not released and token and token != st.engineer_token:
+        st = _new_engineer(st, holder, site, token)
+    return st
+
+
+def _new_engineer(st: State, holder: str, site: str, token: str) -> State:
+    """I16: the incoming holder inherits the constraint UNCHANGED, at revision 1 under the new
+    generation, in the same step that mints it. Only afterwards may they change anything."""
+    st = replace(st, plant_generation=st.plant_generation + 1, engineer_token=token)
+    c = st.constraint
+    if c is not None:
+        st = replace(st, constraint=replace(c, fence=st.plant_fence, revision=1, controller_id=holder, controller_site=site))
+    return st
+
+
+def observe_constraint(st: State, c: Constraint, now_ms: int) -> tuple[State, bool, str]:
+    """A `propulsion_constraint` record: applied only under the current plant fence, at a revision newer
+    than the one in force under it, and written by the live ENGINEER holder. Anything else is dropped
+    -- so the outgoing engineer's record under the old generation can never relax the inherited one."""
+    if c.fence != st.plant_fence:
+        return st, False, "not under the current plant_generation"
+    cur = st.constraint
+    if cur is not None and cur.fence == c.fence and c.revision <= cur.revision:
+        return st, False, f"revision {c.revision} is not newer than {cur.revision}"
+    eng = st.leases.get("engineer")
+    if eng is None or not eng.live(now_ms) or eng.holder != c.controller_id:
+        return st, False, f"{c.controller_id} does not hold a live ENGINEER lease"
+    return replace(st, constraint=c), True, ""
+
+
+def _clamp(st: State, pol: Policy, dof: str, v: float) -> tuple[float, str]:
+    """The plant constraint on one resolved value: an inhibited device sits at zero, a derated one at
+    |value| <= max_power_pct. A DOF that drives no constrained device passes unchanged."""
+    c = st.constraint
+    device = pol.propulsion.get(dof)
+    lim = c.limit(device) if c is not None and device else None
+    if lim is None:
+        return v, ""
+    why = f" ({lim.reason})" if lim.reason else ""
+    if lim.inhibit:
+        return 0.0, f"inhibited by propulsion_constraint: {device}{why}"
+    if lim.max_power_pct is not None and abs(v) > lim.max_power_pct:
+        cap = float(lim.max_power_pct)
+        return (cap if v > 0 else -cap), f"clamped by propulsion_constraint: {device} {cap:g} %{why}"
+    return v, ""
 
 
 def observe_session(st: State, role: str, holder: str, token: str, assignment_id: str, ttl_ms: int, released: bool,
@@ -575,21 +664,26 @@ def resolve(st: State, pol: Policy, now_ms: int) -> tuple[State, tuple[Resolved,
         requested = acc.value_pct if acc is not None else None
         if not allowed:
             rows.append(Resolved(dof, requested, None, "", INHIBITED, why))
-            emitting[dof] = pol.transition_value(dof)
+            emitting[dof] = _clamp(st, pol, dof, pol.transition_value(dof))[0]
             continue
         if st.in_transition or m is None:
-            v = pol.transition_value(dof)
-            rows.append(Resolved(dof, requested, v, "", TRANSITION, st.transition_reason or pol.transition_name))
+            v, clamped = _clamp(st, pol, dof, pol.transition_value(dof))
+            rows.append(Resolved(dof, requested, v, "", TRANSITION, _why(st.transition_reason or pol.transition_name, clamped)))
             emitting[dof] = v
             continue
         if acc is None or now_ms - acc.recv_ms > pol.max_axis_age_ms or acc.source != m.execution_source:
-            v = pol.transition_value(dof)
-            rows.append(Resolved(dof, requested, v, m.execution_source, STALE, "the mapped source is silent"))
+            v, clamped = _clamp(st, pol, dof, pol.transition_value(dof))
+            rows.append(Resolved(dof, requested, v, m.execution_source, STALE, _why("the mapped source is silent", clamped)))
             emitting[dof] = v
             continue
-        rows.append(Resolved(dof, requested, acc.value_pct, acc.source, ACTIVE, provenance=acc))
-        emitting[dof] = acc.value_pct
+        v, clamped = _clamp(st, pol, dof, acc.value_pct)
+        rows.append(Resolved(dof, requested, v, acc.source, ACTIVE, clamped, provenance=acc))
+        emitting[dof] = v
     return replace(st, emitting=emitting), tuple(rows)
+
+
+def _why(reason: str, clamped: str) -> str:
+    return f"{reason}; {clamped}" if clamped else reason
 
 
 def tick(st: State, pol: Policy, now_ms: int) -> tuple[State, str]:

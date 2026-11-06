@@ -29,6 +29,7 @@ from keelson.payloads.ControlCandidate_pb2 import ControlCandidate
 from keelson.payloads.GuidanceCandidate_pb2 import GuidanceCandidate
 from keelson.payloads.ControlMapping_pb2 import TransferCommit, TransferPrepare
 from keelson.payloads.NavigationState_pb2 import NavigationState
+from keelson.payloads.PropulsionConstraint_pb2 import PropulsionConstraint
 from keelson.payloads.SafetyState_pb2 import SafetyState
 from keelson.scaffolding import add_common_arguments, create_zenoh_config, setup_logging
 from keelson.scaffolding.liveliness import declare_liveliness
@@ -94,6 +95,9 @@ def main() -> int:
             ttl = int(rec.lease_ttl_seconds) * 1000
             if path == vessel:
                 gate.observe_lease("conn", rec.controller_id, rec.token, ttl, rec.released)
+            elif path == f"{vessel}/engineer":
+                # A new ENGINEER token is a new plant_generation, minted here (crowsnest-dev#270).
+                gate.observe_lease("engineer", rec.controller_id, rec.token, ttl, rec.released, rec.controller_site)
             elif path == f"{vessel}/navigation" and rec.HasField("navigation_authority"):
                 gate.observe_navigation(*codec.navigation_from_record(rec))
             elif path in (f"{vessel}/overall/session", f"{vessel}/navigational/session"):
@@ -110,6 +114,9 @@ def main() -> int:
         def on_safety(sample):
             s = _decode(sample, SafetyState)
             gate.observe_safety(int(s.state), bool(s.local_lockout))
+
+        def on_constraint(sample):
+            gate.observe_constraint(codec.constraint_from_proto(_decode(sample, PropulsionConstraint)))
 
         def guarded(fn):
             def run(sample):
@@ -145,7 +152,12 @@ def main() -> int:
             session.declare_subscriber(f"{base}/command_authority/**", guarded(on_authority)),
             session.declare_subscriber(f"{base}/command_assignment/{vessel}", guarded(on_assignment)),
             session.declare_subscriber(f"{base}/safety_state/{vessel}", guarded(on_safety)),
+            session.declare_subscriber(f"{base}/propulsion_constraint/{vessel}", guarded(on_constraint)),
         ]
+        # Stored: a constraint written while this gate was down is still the one in force.
+        for reply in session.get(f"{base}/propulsion_constraint/{vessel}", timeout=2.0):
+            if reply.ok is not None:
+                guarded(on_constraint)(reply.ok)
 
         def parse(cls, op):
             msg = cls()
@@ -187,6 +199,12 @@ def main() -> int:
                         ts.GetCurrentTime()
                         rc = codec.resolved_control(gate.last_cycle, vessel, args.source_id, ts)
                         session.put(f"{base}/resolved_control/{vessel}", keelson.enclose(rc.SerializeToString()))
+                    for c in gate.take_publications():
+                        # The inherited constraint, rebased at revision 1 under the new plant_generation (I16).
+                        ts = Timestamp()
+                        ts.GetCurrentTime()
+                        session.put(f"{base}/propulsion_constraint/{vessel}",
+                                    keelson.enclose(codec.constraint_to_proto(c, vessel, ts).SerializeToString()))
                 except Exception:  # pylint: disable=broad-except
                     log.exception("cycle failed")
                 time.sleep(max(0.0, period - (time.monotonic() - t0)))

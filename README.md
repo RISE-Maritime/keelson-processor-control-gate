@@ -82,6 +82,24 @@ sample has to pass the gate's own test before it reaches actuation.
   reinitialises with no map and enters the transition state. Every command from before is then from
   a term that no longer exists. That is the safe direction for an enforcer, unlike the manager,
   which refuses to start.
+- **It mints `plant_generation` and clamps by the engineer's constraint** (§1.1, I16,
+  crowsnest-dev#270).
+  - **What mints a generation:** the authority manager authorises a change of ENGINEER holder by
+    publishing the new holder's lease. A token the gate has not seen is that change, and the gate
+    mints the next generation under its own term.
+  - **Inheritance:** in the same step, persisted before anything else, it rebases the constraint
+    in force onto the new generation. The devices are the same, at revision 1, and the gate
+    publishes the result on `propulsion_constraint/{vessel}`. A change of engineer can therefore
+    never relax a constraint.
+  - **Applying a record:** a record is applied only if it is under the current plant fence, at a
+    newer revision, and written by the live ENGINEER holder. The outgoing engineer's late record,
+    under the old generation, is dropped.
+  - **Clamping:** every resolved value of a DOF that the policy's `propulsion` maps to a device is
+    clamped, whether ACTIVE, STALE or in TRANSITION. An inhibited device gives 0, and a derate caps
+    the magnitude, astern included. The reason is on the row.
+  - **What never moves it:** a lapsed or released ENGINEER lease mints nothing and lifts nothing.
+    The conn and the payload leases never move `plant_generation`, and a plant change never moves
+    the motion fence.
 
 ## Keys
 
@@ -94,6 +112,9 @@ sample has to pass the gate's own test before it reaches actuation.
 | hears `control_candidate/**` and `guidance_candidate/**` | the helm's and the navigator's proposals, per DOF |
 | hears `command_authority/{vessel}/navigation` | the navigation authority document, for DECISION |
 | hears `navigation_state/**` | each producer's human order in force, for HUMAN_ORDER, stamped on local receipt |
+| hears `command_authority/{vessel}/engineer` | a new ENGINEER token mints `plant_generation` |
+| hears `propulsion_constraint/{vessel}` (and reads storage at boot) | the plant constraint, under the plant fence |
+| publishes `propulsion_constraint/{vessel}` | only on a new ENGINEER holder: the inherited constraint at revision 1 |
 | publishes `resolved_control/{vessel}` | every cycle: the rolling acknowledgement |
 
 ## Developing before the build
@@ -127,8 +148,11 @@ also needs the manager's maintenance PR (#377).
 - **Comparing a function envelope (knots) with a DOF's percent.** The DOF's execution envelope still
   bounds the value.
 - **Each navigation function's `holder_lease_id`**, and its `comms_loss_behaviour` when that lapses.
-- **Constraint clamping** (`propulsion_constraint`, `motion_constraint`), keeping a latched constraint
-  when its writer dies (I5), and restore-and-rebase on a new term (I16).
+- **`motion_constraint`**, and keeping a latched one when its writer dies (I5). `propulsion_constraint`
+  clamping and the ENGINEER handover are done (crowsnest-dev#270).
+- **I16 on a new term:** restoring, validating and rebasing the plant constraint when the store is
+  reinitialised, before ACTUATION_ALLOWED. Today a reinitialised gate starts with no constraint in
+  force, so the HIL case `i16-derate-engineer-reinit` stays pending.
 - **The rest of the §3.2 watchdogs:** `CONTROL_LINK_HEALTH`, `CONTROLLER_SUPERVISION_CHANNEL_HEALTH`,
   payload-gate liveliness, supervisor liveliness in `operational`, and
   `on_safety_supervisor_loss_while_active`.
