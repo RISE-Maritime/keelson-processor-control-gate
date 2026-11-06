@@ -37,6 +37,7 @@ class Cycle:
     actuation_reason: str
     in_transition: bool
     transition_reason: str
+    now_ms: int | None = None  # the cycle's monotonic time: t4, against which a row's hold is measured
 
 
 class Gate:
@@ -156,7 +157,7 @@ class Gate:
             for gid in sorted(self.policy.groups):
                 self.group_sequences[gid] = self.group_sequences.get(gid, 0) + 1
                 groups.append((gid, self.group_sequences[gid]))
-            cycle = Cycle(rows, st.fence, self.sequence, tuple(groups), allowed, why, st.in_transition, st.transition_reason)
+            cycle = Cycle(rows, st.fence, self.sequence, tuple(groups), allowed, why, st.in_transition, st.transition_reason, now)
         self.actuator.apply(rows)
         self.last_cycle = cycle
         return rows

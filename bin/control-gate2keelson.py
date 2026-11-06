@@ -64,6 +64,15 @@ def _decode(sample, cls):
     return msg
 
 
+def _decode_timed(sample, cls):
+    """(message, received wall ns, enclosed wall ns): the gate's receipt (t3) and the source's
+    publish (t2), for the provenance ResolvedControl carries (crowsnest-dev#98). Never judged."""
+    received_ns, enclosed_ns, payload = keelson.uncover(sample.payload.to_bytes())
+    msg = cls()
+    msg.ParseFromString(payload)
+    return msg, received_ns, enclosed_ns
+
+
 def main() -> int:
     args = build_parser().parse_args()
     setup_logging(level=args.log_level)
@@ -114,10 +123,14 @@ def main() -> int:
             return int(time.monotonic() * 1000)
 
         def on_control_candidate(sample):
-            gate.sample(codec.sample_from_control_candidate(_decode(sample, ControlCandidate), mono_ms()))
+            recv_ms = mono_ms()
+            msg, received_ns, enclosed_ns = _decode_timed(sample, ControlCandidate)
+            gate.sample(codec.sample_from_control_candidate(msg, recv_ms, received_ns, enclosed_ns))
 
         def on_guidance_candidate(sample):
-            gate.guidance(codec.guidance_from_proto(_decode(sample, GuidanceCandidate), mono_ms()))
+            recv_ms = mono_ms()
+            msg, received_ns, enclosed_ns = _decode_timed(sample, GuidanceCandidate)
+            gate.guidance(codec.guidance_from_proto(msg, recv_ms, received_ns, enclosed_ns))
 
         def on_navigation_state(sample):
             # The producer is the key's remainder after the subject: what a HUMAN_ORDER's source spells.

@@ -90,9 +90,17 @@ def assignment_seen(pb):
 # ---------------------------------------------------------------------------- the data plane (#272)
 
 
-def sample_from_control_candidate(pb, recv_ms: int) -> model.Sample:
+def _provenance(pb, recv_wall_ns, published_ns) -> dict:
+    """What a candidate says about its own times, plus the gate's wall receipt (crowsnest-dev#98)."""
+    return dict(sample_time_ns=pb.timestamp.ToNanoseconds() if pb.HasField("timestamp") else None,
+                published_ns=published_ns, clock_quality=int(pb.stream.clock_quality), recv_wall_ns=recv_wall_ns)
+
+
+def sample_from_control_candidate(pb, recv_ms: int, recv_wall_ns: int | None = None,
+                                  published_ns: int | None = None) -> model.Sample:
     fence = fence_from_proto(pb.fence) if pb.HasField("fence") else None
-    return model.Sample(pb.source, pb.dof, float(pb.value_pct), pb.stream.stream_id, int(pb.stream.sequence), recv_ms, fence)
+    return model.Sample(pb.source, pb.dof, float(pb.value_pct), pb.stream.stream_id, int(pb.stream.sequence), recv_ms, fence,
+                        **_provenance(pb, recv_wall_ns, published_ns))
 
 
 def _function_name(value: int) -> str:
@@ -101,11 +109,13 @@ def _function_name(value: int) -> str:
     return NavigationFunction.Name(value).removeprefix("NAVIGATION_FUNCTION_").lower()
 
 
-def guidance_from_proto(pb, recv_ms: int) -> model.Guidance:
+def guidance_from_proto(pb, recv_ms: int, recv_wall_ns: int | None = None,
+                        published_ns: int | None = None) -> model.Guidance:
     decision = pb.WhichOneof("decision_basis") or ""
     execution = pb.WhichOneof("execution_basis") or ""
     g = dict(source=pb.source, dof=pb.dof, value_pct=float(pb.value_pct), stream_id=pb.stream.stream_id,
-             sequence=int(pb.stream.sequence), recv_ms=recv_ms, decision=decision, execution=execution)
+             sequence=int(pb.stream.sequence), recv_ms=recv_ms, decision=decision, execution=execution,
+             **_provenance(pb, recv_wall_ns, published_ns))
     if decision == "nav_function":
         g.update(function=_function_name(pb.nav_function.function), nav_revision=int(pb.nav_function.navigation_authority_revision))
     elif decision == "human_order":
@@ -142,6 +152,21 @@ def resolved_control(cycle, vessel_id: str, gate_id: str, now=None):
             d.requested_pct = r.requested
         if r.value is not None:
             d.accepted_pct = r.value
+        _put_provenance(d, r.provenance, cycle.now_ms)
         out.dofs.append(d)
     return out
 
+
+def _put_provenance(d, p, cycle_now_ms) -> None:
+    """The accepted sample's stream, sequence and times on its ResolvedDof, copied and never judged.
+    gate_hold_ms is receipt -> this cycle on the gate's monotonic clock: exact. Absent when no
+    sample is accepted (only an ACTIVE row carries one)."""
+    if p is None:
+        return
+    d.source_stream_id, d.source_sequence, d.source_clock_quality = p.stream_id, p.sequence, p.clock_quality
+    for name, ns in (("source_sample_time", p.sample_time_ns), ("source_published_at", p.published_ns),
+                     ("gate_received_at", p.recv_wall_ns)):
+        if ns is not None:
+            getattr(d, name).FromNanoseconds(ns)
+    if cycle_now_ms is not None:
+        d.gate_hold_ms = max(0, cycle_now_ms - p.recv_ms)

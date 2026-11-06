@@ -593,3 +593,71 @@ def test_the_order_freshness_window_is_policy(tmp_path, clock):
 
     assert parse({"dofs": ["rudder"], "navigation_state_max_age_ms": 4500}).navigation_state_max_age_ms == 4500
     assert parse({"dofs": ["rudder"]}).navigation_state_max_age_ms == 3000
+
+
+# ---------------------------------------------------------------------------- provenance (crowsnest-dev#98)
+
+
+def _active_rudder(tmp_path, clock):
+    g = make(tmp_path, clock)
+    clear(g)
+    lease(g)
+    Helm(g, clock).all(0)
+    take(g, clock)
+    return g
+
+
+def test_resolved_control_names_the_sample_it_accepted_and_its_hold(tmp_path, clock):
+    """t1 sample, t2 publish, t3 receipt (wall) and t3→t4 on the gate's own clock, copied from the
+    accepted candidate onto its ResolvedDof."""
+    from keelson.payloads.ControlCandidate_pb2 import ControlCandidate
+    from keelson.payloads.GuidanceCandidate_pb2 import CandidateStream, ClockQuality
+
+    from control_gate import codec
+
+    g = _active_rudder(tmp_path, clock)
+    pb = ControlCandidate(source="ROC-1/helm-1/rudder", dof="rudder", value_pct=12.0,
+                          stream=CandidateStream(stream_id="s1", sequence=99, clock_quality=ClockQuality.CLOCK_QUALITY_SYNCHRONISED))
+    pb.timestamp.FromNanoseconds(1_000_000_000)
+    recv_ms = clock()
+    ok, why = g.sample(codec.sample_from_control_candidate(pb, recv_ms, recv_wall_ns=1_060_000_000, published_ns=1_004_000_000))
+    assert ok, why
+    clock.t += 37
+    g.cycle()
+    rc = codec.resolved_control(g.last_cycle, V, "control-gate")
+    d = next(d for d in rc.dofs if d.dof == "rudder")
+    assert (d.source_stream_id, d.source_sequence, d.source_clock_quality) == ("s1", 99, ClockQuality.CLOCK_QUALITY_SYNCHRONISED)
+    assert d.source_sample_time.ToNanoseconds() == 1_000_000_000
+    assert d.source_published_at.ToNanoseconds() == 1_004_000_000
+    assert d.gate_received_at.ToNanoseconds() == 1_060_000_000
+    assert d.HasField("gate_hold_ms") and d.gate_hold_ms == 37
+
+
+def test_a_row_with_no_accepted_sample_carries_no_provenance(tmp_path, clock):
+    from control_gate import codec
+
+    g = _active_rudder(tmp_path, clock)
+    Helm(g, clock).put("rudder", 5)
+    g.observe_safety(2, False)  # STOPPED: INHIBITED, nothing emitted
+    g.cycle()
+    stopped = codec.resolved_control(g.last_cycle, V, "control-gate")
+    for d in stopped.dofs:
+        assert not d.HasField("gate_hold_ms") and not d.HasField("source_sample_time") and d.source_sequence == 0
+    clear(g)
+    clock.t += POL.max_axis_age_ms + 1  # silent past the dead-man: STALE
+    g.cycle()
+    stale = codec.resolved_control(g.last_cycle, V, "control-gate")
+    assert all(d.control_state == 2 and not d.HasField("gate_hold_ms") for d in stale.dofs)
+
+
+def test_provenance_decides_nothing(tmp_path, clock):
+    """Two gates fed samples that differ only in provenance resolve identically, row for row."""
+    out = []
+    for i, prov in enumerate(({}, {"sample_time_ns": 1, "published_ns": 2, "clock_quality": 2, "recv_wall_ns": 10**18})):
+        g = _active_rudder(tmp_path / str(i), clock)
+        src = "ROC-1/helm-1/rudder"
+        seq = g._test_seqs[(src, "s1")] + 1
+        ok, why = g.sample(Sample(src, "rudder", 33.0, "s1", seq, clock(), **prov))
+        out.append((ok, why, g.cycle()))
+    assert out[0] == out[1]
+    assert Sample("a", "rudder", 1.0, "s", 1, 5) == Sample("a", "rudder", 1.0, "s", 1, 5, sample_time_ns=7, recv_wall_ns=9)

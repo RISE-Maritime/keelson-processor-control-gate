@@ -132,6 +132,12 @@ class Sample:
     sequence: int
     recv_ms: int
     fence: Fence | None = None
+    # PROVENANCE, for latency and audit only (crowsnest-dev#98): no decision reads it, and
+    # compare=False keeps it out of equality, so two samples that differ only here are one sample.
+    sample_time_ns: int | None = field(default=None, compare=False)  # t1, the source's clock
+    published_ns: int | None = field(default=None, compare=False)  # t2, the source's clock
+    clock_quality: int = field(default=0, compare=False)  # keelson.ClockQuality
+    recv_wall_ns: int | None = field(default=None, compare=False)  # t3, this gate's wall clock
 
 
 @dataclass(frozen=True)
@@ -154,6 +160,12 @@ class Guidance:
     order_id: str = ""
     execution: str = ""
     mapping_id: str = ""
+    # PROVENANCE, for latency and audit only (crowsnest-dev#98): no decision reads it, and
+    # compare=False keeps it out of equality, so two samples that differ only here are one sample.
+    sample_time_ns: int | None = field(default=None, compare=False)  # t1, the source's clock
+    published_ns: int | None = field(default=None, compare=False)  # t2, the source's clock
+    clock_quality: int = field(default=0, compare=False)  # keelson.ClockQuality
+    recv_wall_ns: int | None = field(default=None, compare=False)  # t3, this gate's wall clock
 
 
 @dataclass(frozen=True)
@@ -178,7 +190,8 @@ CONTROL_METHOD_DELEGATED = 3
 
 @dataclass(frozen=True)
 class Resolved:
-    """One DOF of one cycle: what was asked, what goes out, and why. `value` None = emit nothing."""
+    """One DOF of one cycle: what was asked, what goes out, and why. `value` None = emit nothing.
+    `provenance` is the accepted sample an ACTIVE row carries, copied into ResolvedDof; never judged."""
 
     dof: str
     requested: float | None
@@ -186,6 +199,7 @@ class Resolved:
     source: str
     control_state: str
     reason: str = ""
+    provenance: Sample | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -536,7 +550,8 @@ def on_guidance(st: State, pol: Policy, g: Guidance, now_ms: int) -> tuple[State
     why = decision_check(st, pol, g, now_ms)
     if not why:
         why = execution_check(st, g, now_ms)
-    sample = Sample(g.source, g.dof, g.value_pct, g.stream_id, g.sequence, g.recv_ms)
+    sample = Sample(g.source, g.dof, g.value_pct, g.stream_id, g.sequence, g.recv_ms, sample_time_ns=g.sample_time_ns,
+                    published_ns=g.published_ns, clock_quality=g.clock_quality, recv_wall_ns=g.recv_wall_ns)
     if why:
         # Refused to ACT on, but still what the source says now: neutral-or-match (prepare) reads it.
         # Without this, a carry-out mapping could never be committed -- prepare needs a fresh sample
@@ -572,7 +587,7 @@ def resolve(st: State, pol: Policy, now_ms: int) -> tuple[State, tuple[Resolved,
             rows.append(Resolved(dof, requested, v, m.execution_source, STALE, "the mapped source is silent"))
             emitting[dof] = v
             continue
-        rows.append(Resolved(dof, requested, acc.value_pct, acc.source, ACTIVE))
+        rows.append(Resolved(dof, requested, acc.value_pct, acc.source, ACTIVE, provenance=acc))
         emitting[dof] = acc.value_pct
     return replace(st, emitting=emitting), tuple(rows)
 

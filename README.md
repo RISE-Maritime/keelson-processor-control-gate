@@ -71,6 +71,11 @@ sample has to pass the gate's own test before it reaches actuation.
     nothing**, never 0;
   - the control state and its reason;
   - feedback marked NONE, since no connector reports what it applied yet.
+  - on an ACTIVE row, the **provenance** of the accepted sample (crowsnest-dev#98): its stream,
+    sequence and clock quality, its sample and publish times, the gate's wall-clock receipt, and
+    `gate_hold_ms`, receipt to this cycle on the gate's monotonic clock. A station times the hops
+    from these. They are copied, never judged: they are kept out of a sample's equality, and a test
+    proves that two samples differing only there resolve identically.
 
   The message also carries the motion fence, a message sequence and a sequence per coupled group.
 - **A lost store is a new term.** If the store is missing, corrupt or fails its hash, the gate
