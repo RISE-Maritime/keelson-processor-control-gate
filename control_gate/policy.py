@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .attestation import parse_keys
 from .model import Policy
 
 
@@ -20,8 +21,21 @@ def parse(d: dict) -> Policy:
     propulsion = {str(k): str(v) for k, v in (d.get("propulsion") or {}).items()}
     if not set(propulsion) <= set(dofs):
         raise ValueError("propulsion names a DOF the vessel does not have")
+    profile = d.get("command_profile", "test")
+    att = d.get("attestation") or {}
+    keys = parse_keys(att.get("keys") or {})
+    required = bool(att.get("required", profile == "operational"))
+    # Required with nobody to vouch: the last-resort direct abort would refuse everyone. Say so at
+    # load, not at sea.
+    if required and not keys:
+        raise ValueError("attestation is required (operational) but the policy names no trusted key: "
+                         "the direct abort would refuse everyone")
+    ttl = int(att.get("challenge_ttl_ms", 15000))
+    rotate = int(att.get("rotate_ms", 5000))
+    if not 0 < rotate < ttl:
+        raise ValueError("attestation.rotate_ms must be above 0 and below challenge_ttl_ms, or no challenge is ever live")
     return Policy(
-        command_profile=d.get("command_profile", "test"),
+        command_profile=profile,
         dofs=dofs,
         automation_sources=frozenset(d.get("automation_sources") or ()),
         max_axis_age_ms=int(d.get("max_axis_age_ms", 1000)),
@@ -37,6 +51,10 @@ def parse(d: dict) -> Policy:
         groups={str(k): tuple(v) for k, v in (d.get("groups") or {}).items()},
         navigation_state_max_age_ms=int(d.get("navigation_state_max_age_ms", 3000)),
         propulsion=propulsion,
+        attestation_keys=keys,
+        attestation_required=required,
+        challenge_ttl_ms=ttl,
+        challenge_rotate_ms=rotate,
     )
 
 

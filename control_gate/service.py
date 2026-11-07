@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from . import model
+from . import attestation, model
 from .model import Ack, DirectAbort, Fence, Policy, Proposal, Sample
 
 log = logging.getLogger(__name__)
@@ -38,6 +38,7 @@ class Cycle:
     in_transition: bool
     transition_reason: str
     now_ms: int | None = None  # the cycle's monotonic time: t4, against which a row's hold is measured
+    attestation_challenge: bytes = b""  # the newest the direct abort accepts (#316)
 
 
 class Gate:
@@ -55,6 +56,10 @@ class Gate:
         self.last_cycle: Cycle | None = None
         self.helm_health: dict[str, int] = {}  # source -> its last accepted sample's own device_health (#309)
         self.outbox: list = []  # plant constraints the gate rebased, for bin/ to publish (take_publications)
+        # The direct abort's attestation (crowsnest-dev#316): the challenges this gate drew and the
+        # sequences it accepted. In memory only, so a restart makes every earlier attestation stale.
+        self.challenges = attestation.Challenges(policy.challenge_ttl_ms)
+        self.seen: dict = {}
 
     def boot(self) -> model.State:
         with self.lock:
@@ -64,6 +69,7 @@ class Gate:
                 self.store.save(st)
                 self.events.append(f"reinitialised: {why}")
             self.state = st
+            self.challenges.rotate(self.now_ms())
             log.info("fence (%s…, %d), %s", st.term[:8], st.generation,
                      "transition" if st.in_transition else f"{len(st.mappings)} DOF(s) mapped at {st.station}")
             return st
@@ -94,13 +100,39 @@ class Gate:
 
     def abort_direct(self, d: DirectAbort) -> tuple[bool, str, Fence]:
         with self.lock:
+            principal, refused = self._attest(d)
+            if refused:
+                log.warning("direct abort by %s REFUSED: %s", d.requester, refused)
+                return False, refused, self.state.fence
             st, ok, detail = model.abort_direct(self.state, d, self.now_ms())
             if ok:
                 self.store.save(st)
-                self.events.append(f"direct abort by {d.requester} at generation {st.generation}")
-                log.warning("ABORT AUTOMATION (direct) by %s: fenced at generation %d", d.requester, st.generation)
+                by = f" (attested by {principal['service']} for {principal['station'] or principal['site']})" if principal else ""
+                self.events.append(f"direct abort by {d.requester} at generation {st.generation}{by}")
+                log.warning("ABORT AUTOMATION (direct) by %s%s: fenced at generation %d", d.requester, by, st.generation)
             self.state = st
             return ok, detail, st.fence
+
+    def _attest(self, d: DirectAbort) -> tuple[dict | None, str]:
+        """(principal, "") when the call may proceed, else (None, why refused). A present attestation is
+        always verified; a missing one is refused only where the policy requires one."""
+        att = d.attestation
+        if att is not None:
+            v = attestation.verify(att, d.request, self.policy.attestation_keys, self.challenges, self.seen,
+                                   self.now_ms())
+            return (v.principal, "") if v.ok else (None, v.outcome)
+        if self.policy.attestation_required:
+            return None, attestation.MISSING
+        return None, ""
+
+    def attestation_challenge(self) -> bytes:
+        """The newest challenge, drawn anew every `challenge_rotate_ms` on the gate's clock."""
+        with self.lock:
+            now = self.now_ms()
+            drawn = self.challenges.drawn_ms()
+            if drawn is None or now - drawn >= self.policy.challenge_rotate_ms:
+                self.challenges.rotate(now)
+            return self.challenges.newest(now)
 
     # ------------------------------------------------------------------ what the gate hears
 
@@ -209,7 +241,8 @@ class Gate:
             for gid in sorted(self.policy.groups):
                 self.group_sequences[gid] = self.group_sequences.get(gid, 0) + 1
                 groups.append((gid, self.group_sequences[gid]))
-            cycle = Cycle(rows, st.fence, self.sequence, tuple(groups), allowed, why, st.in_transition, st.transition_reason, now)
+            cycle = Cycle(rows, st.fence, self.sequence, tuple(groups), allowed, why, st.in_transition, st.transition_reason, now,
+                          self.attestation_challenge())
         self.actuator.apply(rows)
         self.last_cycle = cycle
         return rows

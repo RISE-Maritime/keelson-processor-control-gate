@@ -15,6 +15,9 @@ dependencies = [
     # PENDING: the build has not been cut yet; until it is, develop against a local merge of those
     # branches (README, "Developing before the build").
     "keelson==0.6.0.dev21",
+    # Ed25519 for the ROC service's attestation on the direct abort (crowsnest-dev#316), the
+    # authority manager's pin.
+    "cryptography==50.0.2",
 ]
 
 [project.optional-dependencies]

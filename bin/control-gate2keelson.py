@@ -101,6 +101,16 @@ def main() -> int:
         return 2
     if not policy.require_maintenance_state:
         log.warning("require_maintenance_state is OFF: a rig with no maintenance_state. Never on a vessel.")
+    attested = "attestation" in AbortAutomationRequest.DESCRIPTOR.fields_by_name
+    if policy.attestation_required and not attested:
+        log.error("attestation is required on the direct abort, and this keelson SDK has no "
+                  "AbortAutomationRequest.attestation (crowsnest-dev#316): every direct abort would be refused. "
+                  "Install an SDK that carries it.")
+        return 2
+    # Counts and ids only: a public key is not a secret, but nothing here needs to print one.
+    log.info("direct abort: attestation %s, %d trusted key(s)%s",
+             "REQUIRED" if policy.attestation_required else "optional (verified when present)",
+             len(policy.attestation_keys), f" {sorted(policy.attestation_keys)}" if policy.attestation_keys else "")
 
     conf = create_zenoh_config(args.mode, args.connect, args.listen, zenoh_config=args.zenoh_config)
     with zenoh.open(conf) as session:

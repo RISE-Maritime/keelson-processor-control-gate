@@ -345,6 +345,12 @@ class Policy:
     groups: dict = field(default_factory=dict)  # group_id -> dofs that move together (ResolvedControl)
     propulsion: dict = field(default_factory=dict)  # dof -> the platform's propulsion[].id it drives
     navigation_state_max_age_ms: int = 3000  # a HUMAN_ORDER is checked against a record this fresh
+    # The ROC services this vessel trusts to attest who asks for a direct abort (attestation.py):
+    # key_id -> TrustedKey, maintenance configuration, never over the link (crowsnest-dev#316).
+    attestation_keys: dict = field(default_factory=dict)
+    attestation_required: bool = False  # default: command_profile == "operational" (policy.py)
+    challenge_ttl_ms: int = 15000
+    challenge_rotate_ms: int = 5000  # a new challenge on resolved_control this often
 
     def transition_value(self, dof: str) -> float:
         return float(self.transition_values.get(dof, 0.0))
@@ -778,6 +784,10 @@ class DirectAbort:
     assignment_revision: int
     session_token: str
     reason: str = ""
+    # The ROC service's attestation and the request it signed (control_gate/v1, crowsnest-dev#316):
+    # verified in service.Gate before this projection check, never by it.
+    attestation: object = field(default=None, compare=False)
+    request: object = field(default=None, compare=False)
 
 
 def abort_direct(st: State, d: DirectAbort, now_ms: int) -> tuple[State, bool, str]:

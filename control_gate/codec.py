@@ -110,7 +110,10 @@ def gate_state(st: model.State) -> GateState:
 
 
 def direct_abort_from_proto(pb) -> DirectAbort:
-    return DirectAbort(pb.requester_id, pb.assignment_id, int(pb.assignment_revision), pb.session_token, pb.reason)
+    # keelson AbortAutomationRequest.attestation (crowsnest-dev#316); a build without it carries none.
+    att = pb.attestation if "attestation" in pb.DESCRIPTOR.fields_by_name and pb.HasField("attestation") else None
+    return DirectAbort(pb.requester_id, pb.assignment_id, int(pb.assignment_revision), pb.session_token, pb.reason,
+                       attestation=att, request=pb)
 
 
 def abort_response(ok: bool, detail: str, fence: Fence) -> AbortAutomationResponse:
@@ -182,6 +185,8 @@ def resolved_control(cycle, vessel_id: str, gate_id: str, now=None):
                           groups=[GroupSequence(group_id=g, sequence=n) for g, n in cycle.groups])
     if now is not None:
         out.timestamp.CopyFrom(now)
+    if cycle.attestation_challenge and "attestation_challenge" in out.DESCRIPTOR.fields_by_name:
+        out.attestation_challenge = cycle.attestation_challenge  # #316; a build without it says nothing
     for r in cycle.rows:
         d = ResolvedDof(dof=r.dof, control_state=_STATE.get(r.control_state, 0), source=r.source, reason=r.reason,
                         feedback_quality=FeedbackQuality.FEEDBACK_QUALITY_NONE)

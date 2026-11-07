@@ -65,6 +65,23 @@ sample has to pass the gate's own test before it reaches actuation.
     assignment they acted under, a CONN lapse with nobody. The cause is persisted, cleared by the next
     COMMIT, and exposed as `GateState.last_fence_cause` in the keelson builds that carry it. A manager
     that was down reads it at reconcile and takes the navigator's functions back to that human.
+  - **Attested, by the gate itself** (crowsnest-dev#316; trust chain B, COMMAND-ARCHITECTURE §6).
+    `requester_id` is a label. The ROC authority service's Ed25519-signed claim on
+    `AbortAutomationRequest.attestation` (the manager's own `Attestation` type) is what names who
+    is asking. The gate checks it in `control_gate/attestation.py`, a port of the manager's
+    verifier, against the policy's trusted keys, before the projection check:
+    - **Its challenge is the gate's own**, because this call is for when the manager is down. A new
+      one is drawn every `rotate_ms`, lives `challenge_ttl_ms` on the gate's monotonic clock, is
+      published as `resolved_control.attestation_challenge`, and is forgotten on restart.
+    - **The claim names `control_gate/v1/abort_automation`**, this request's digest (with
+      `attestation` cleared), and `requester_id`/`requester_site` as its operator and site. Each
+      `(key, session, sequence)` is accepted once, rising. A refused call burns no sequence.
+    - **Missing** is refused only where the policy requires it (`operational` by default), with
+      "requires an attestation … none was presented". **Present and failing** is always refused,
+      with the check that failed. Every refusal is a WARNING; the fence does not move.
+    - **Never silently closed.** A policy that requires attestation with no trusted key refuses to
+      load, and the bin refuses to start on an SDK that cannot carry one. Either way the error says
+      why.
 - **A guidance candidate is checked twice, independently (I15).** The navigator's
   `GuidanceCandidate` must pass both:
   - **DECISION:** under NAV_FUNCTION, the source holds the named function in the navigation
@@ -136,7 +153,21 @@ sample has to pass the gate's own test before it reaches actuation.
 | hears `command_authority/{vessel}/engineer` | a new ENGINEER token mints `plant_generation` |
 | hears `propulsion_constraint/{vessel}` (and reads storage at boot) | the plant constraint, under the plant fence |
 | publishes `propulsion_constraint/{vessel}` | only on a new ENGINEER holder: the inherited constraint at revision 1 |
-| publishes `resolved_control/{vessel}` | every cycle: the rolling acknowledgement |
+| publishes `resolved_control/{vessel}` | every cycle: the rolling acknowledgement, and the direct abort's attestation challenge |
+
+The policy's `attestation` block, the same shape as the manager's:
+
+```json
+"attestation": {
+  "keys": {"roc1-a": {"service_id": "roc1-authority", "public_key": "<base64, raw 32-byte Ed25519>"}},
+  "required": true,
+  "challenge_ttl_ms": 15000,
+  "rotate_ms": 5000
+}
+```
+
+`required` defaults to `command_profile == "operational"`. The keys are maintenance configuration and
+never come over the link.
 
 ## Developing before the build
 
@@ -168,6 +199,15 @@ also needs the manager's maintenance PR (#377).
 `feat/resolved-dof-device-health`, stacked on #386). `0.6.0.dev21` carries neither: the codec reads
 UNKNOWN and an empty profile, writes nothing, and `tests/test_helm_health.py` skips its two codec
 cases.
+
+**The attested direct abort needs `AbortAutomationRequest.attestation` and
+`ResolvedControl.attestation_challenge`** (keelson `feat/gate-abort-attestation`, stacked on #383).
+`0.6.0.dev21` carries neither. On it, the codec reads every abort as unattested and publishes no
+challenge, so under a policy that requires attestation the bin refuses to start.
+`tests/test_abort_attestation.py` skips everything that builds an attested request, naming the
+fields. To develop against it, regenerate that branch's `ControlGate`, `ResolvedControl` and
+`ControlCandidate` modules (merged with `feat/gate-fence-cause` and
+`feat/resolved-dof-device-health`) over a copy of the pinned SDK, and put it first on `PYTHONPATH`.
 
 ## Not in this cut (#85's later slices)
 
