@@ -329,6 +329,88 @@ def test_i16_an_engineer_handover_on_the_bus_never_lets_the_derate_slip(h):
             s.undeclare()
 
 
+
+def test_i16_a_reinitialised_gate_restores_the_stored_derate_and_waits_for_the_engineer(h):
+    """crowsnest-dev#345: the gate's store is gone, and storage (the harness, answering the gate's read)
+    holds a 40 % derate under the old term. The gate rebases it under its new term, publishes it, and
+    holds ACTUATION_ALLOWED false until the ENGINEER writes under the new plant fence; no
+    ResolvedControl ever shows the throttle above 40 %."""
+    import threading
+
+    from keelson.payloads.ControlCandidate_pb2 import ControlCandidate
+    from keelson.payloads.Fence_pb2 import Fence as PbFence
+    from keelson.payloads.GuidanceCandidate_pb2 import CandidateStream
+    from keelson.payloads.PropulsionConstraint_pb2 import PropulsionConstraint
+    from keelson.payloads.ResolvedControl_pb2 import ResolvedControl
+
+    old = PropulsionConstraint(vessel_id=V, controller_id="anna@ECR", controller_site="ECR",
+                               fence=PbFence(term="0123456789abcdef" * 2, generation=4), revision=3,
+                               devices=[PropulsionConstraint.DeviceConstraint(device_id="stbd", max_power_pct=40,
+                                                                              reason="bearing temperature")])
+    storage = h.session.declare_queryable(f"{BASE}/propulsion_constraint/{V}",
+                                          lambda q: q.reply(f"{BASE}/propulsion_constraint/{V}",
+                                                            keelson.enclose(old.SerializeToString())))
+    resolved, constraints = [], []
+    subs = [h.session.declare_subscriber(f"{BASE}/resolved_control/{V}", lambda s: resolved.append(_dec(s, ResolvedControl))),
+            h.session.declare_subscriber(f"{BASE}/propulsion_constraint/{V}",
+                                         lambda s: constraints.append(_dec(s, PropulsionConstraint)))]
+    stop = threading.Event()
+    seq = {"n": 0}
+
+    def helm(dof, value):
+        seq["n"] += 1
+        h.put(f"control_candidate/helm-1/{dof}", ControlCandidate(source=f"ROC-1/helm-1/{dof}", dof=dof, value_pct=value,
+                                                                  stream=CandidateStream(stream_id="s1", sequence=seq["n"])))
+
+    def driving():
+        while not stop.is_set():
+            helm("throttle", 80)
+            time.sleep(0.05)
+
+    def throttle(rc):
+        return next(d for d in rc.dofs if d.dof == "throttle")
+
+    try:
+        h.start_gate(propulsion={"throttle": "stbd"})
+        term = _state(h).fence.term
+        h.wait(lambda: constraints, what="the restored constraint, published under the new term")
+        c = constraints[0]
+        assert (c.fence.term, c.fence.generation, c.revision) == (term, 1, 1) and term != old.fence.term
+        assert [(d.device_id, d.max_power_pct) for d in c.devices] == [("stbd", 40)]
+        h.clear()
+        h.put(f"command_authority/{V}", CommandAuthority(vessel_id=V, controller_id="ted@ROC-1", token="tok", lease_ttl_seconds=60,
+                                                         role=Role.ROLE_CONN))
+        for d in DOFS:
+            helm(d, 0)
+        time.sleep(0.3)
+        rows = [ControlMapping(dof=d, mapping_id=d, authority_holder="ted@ROC-1", authority_lease_id="tok",
+                               execution_source=f"ROC-1/helm-1/{d}") for d in DOFS]
+        ack = h.gate("prepare", TransferPrepare(transfer_id="g1", vessel_id=V, kind=TransferKind.TRANSFER_KIND_GRANT, mappings=rows,
+                                                active_control_station="ROC-1", prepare_ttl_ms=2000), TransferAck)
+        assert ack.accepted, ack.reason
+        assert h.gate("commit", TransferCommit(transfer_id="g1", fence=ack.proposed_fence), CommitResponse).applied
+        threading.Thread(target=driving, daemon=True).start()
+        time.sleep(1.0)
+        last = resolved[-1]
+        assert not last.actuation_allowed and "awaiting the ENGINEER" in last.actuation_reason
+        assert not throttle(last).HasField("accepted_pct")
+
+        h.put(f"command_authority/{V}/engineer", CommandAuthority(vessel_id=V, controller_id="anna@ECR", controller_site="ECR",
+                                                                  token="eng-anna", lease_ttl_seconds=60, role=Role.ROLE_ENGINEER))
+        h.wait(lambda: any(c.fence.generation == 2 for c in constraints), what="the restore rebased onto her generation")
+        h.put(f"propulsion_constraint/{V}", PropulsionConstraint(
+            vessel_id=V, controller_id="anna@ECR", controller_site="ECR", fence=PbFence(term=term, generation=2), revision=2,
+            devices=[PropulsionConstraint.DeviceConstraint(device_id="stbd", max_power_pct=40, reason="confirmed")]))
+        h.wait(lambda: resolved[-1].actuation_allowed and throttle(resolved[-1]).accepted_pct == 40,
+               what="her confirmation to lift the hold, clamped at 40 %")
+        seen = [throttle(rc).accepted_pct for rc in resolved if throttle(rc).HasField("accepted_pct")]
+        assert seen and max(seen) <= 40
+    finally:
+        stop.set()
+        for s in subs:
+            s.undeclare()
+        storage.undeclare()
+
 def test_maintenance_on_the_bus_inhibits_every_dof_and_inactive_releases_it(h):
     """#302: the manager's maintenance_state reaches the gate; anything but INACTIVE inhibits, and says so."""
     from keelson.payloads.MaintenanceState_pb2 import MaintenanceState

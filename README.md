@@ -137,6 +137,19 @@ sample has to pass the gate's own test before it reaches actuation.
   - **What never moves it:** a lapsed or released ENGINEER lease mints nothing and lifts nothing.
     The conn and the payload leases never move `plant_generation`, and a plant change never moves
     the motion fence.
+  - **A new term restores it and waits for a person** (crowsnest-dev#345). A reinitialised store
+    is born holding ACTUATION_ALLOWED false until the gate has read `propulsion_constraint/{vessel}`
+    from storage at boot.
+    - **No record:** no constraint, and the hold is lifted.
+    - **A record:** it is validated, rebased under the new term at revision 1 (the live ENGINEER as
+      its writer, if one is heard), persisted, published, and clamped by from the first cycle. The
+      hold stays until the live ENGINEER writes a revision under the new plant fence. Storage keeps
+      the last record anybody put, which can be one the old gate refused, so a restored record is
+      never trusted to be the one that was in force. Several replies restore the tightest of them.
+    - **An invalid record, or a failed read:** nothing is restored, and the hold stays until the
+      ENGINEER's own record under the new term.
+    - **The hold is persisted,** so a gate restarted before the confirmation keeps waiting. The
+      reason is `actuation_reason` on `resolved_control`.
 
 ## Keys
 
@@ -217,9 +230,7 @@ fields. To develop against it, regenerate that branch's `ControlGate`, `Resolved
 - **Each navigation function's `holder_lease_id`**, and its `comms_loss_behaviour` when that lapses.
 - **`motion_constraint`**, and keeping a latched one when its writer dies (I5). `propulsion_constraint`
   clamping and the ENGINEER handover are done (crowsnest-dev#270).
-- **I16 on a new term:** restoring, validating and rebasing the plant constraint when the store is
-  reinitialised, before ACTUATION_ALLOWED. Today a reinitialised gate starts with no constraint in
-  force, so the HIL case `i16-derate-engineer-reinit` stays pending.
+- **I16 for a latched `motion_constraint`** through a reincarnation, once the gate reads it at all.
 - **The rest of the §3.2 watchdogs:** `CONTROL_LINK_HEALTH`, `CONTROLLER_SUPERVISION_CHANNEL_HEALTH`,
   payload-gate liveliness, supervisor liveliness in `operational`, and
   `on_safety_supervisor_loss_while_active`.

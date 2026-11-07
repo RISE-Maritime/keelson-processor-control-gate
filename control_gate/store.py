@@ -9,7 +9,10 @@ A STORE THAT CANNOT BE TRUSTED IS A NEW TERM. Missing, corrupt, of an unknown sc
 hash: the gate reinitialises with a fresh random term, no map and the transition state. Every command
 from before -- (T, anything) -- is then from a term that no longer exists and is rejected (§4). That
 is the safe direction here, unlike the manager, which refuses to start: an enforcer that forgets
-grants nothing. A reservation is never persisted: it does not survive the gate."""
+grants nothing. A reservation is never persisted: it does not survive the gate.
+
+A new term is also born holding actuation for the plant constraint (model.fresh, #345), and that hold is
+persisted with the rest: a gate restarted before the ENGINEER confirmed a restore keeps waiting."""
 
 from __future__ import annotations
 
@@ -111,7 +114,9 @@ class Store:
                        plant_generation=int(d.get("plant_generation", 1)), engineer_token=str(d.get("engineer_token", "")),
                        constraint=_constraint(d.get("constraint")),
                        # Why it last fenced alone (#290); absent in an older store, never a new term.
-                       last_cause=_cause(d.get("last_cause")))
+                       last_cause=_cause(d.get("last_cause")),
+                       # A restore still waiting for the ENGINEER (#345) waits across a restart too.
+                       plant_hold=str(d.get("plant_hold", "")))
         except (ValueError, KeyError, TypeError) as e:
             return fresh(vessel_id, now_ms), f"the stored state is inconsistent: {e}"
         if len(st.term) != 32:
@@ -124,7 +129,7 @@ class Store:
                            "in_transition": st.in_transition, "transition_reason": st.transition_reason,
                            "plant_generation": st.plant_generation, "engineer_token": st.engineer_token,
                            "constraint": _constraint_json(st.constraint),
-                           "last_cause": _cause_json(st.last_cause)})
+                           "last_cause": _cause_json(st.last_cause), "plant_hold": st.plant_hold})
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self.db.executemany("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",

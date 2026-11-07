@@ -18,6 +18,14 @@ the new fence -- so a change of engineer can never relax it. A constraint record
 the current plant fence, at a newer revision, from the live ENGINEER holder (`observe_constraint`), and
 every resolved value of a propulsion DOF is clamped by it (`resolve`). Silence never lifts it.
 
+A NEW TERM RESTORES IT, AND WAITS FOR A PERSON (I16; crowsnest-dev#345). A reinitialised store holds no
+constraint, so it is born with `plant_hold` set: ACTUATION_ALLOWED is false until `restore_constraints`
+has read storage. No stored record lifts the hold -- none means none. A stored record is validated and
+rebased into the new term (revision 1, the new plant fence) and clamps from the first cycle, but the
+hold STAYS until the live ENGINEER holder writes under the new plant fence: storage keeps the last
+record anybody PUT, which can be one the old gate refused, so it is never trusted to be the one that
+was in force. An invalid record restores nothing and holds the same way. The hold is durable.
+
 IT OWNS BOTH HALVES OF THE MOTION FENCE. The term is a random 128-bit value drawn when the store is
 (re)initialised and never otherwise. The generation is reserved here on an ACK (`prepare`), made
 current only on COMMIT (`commit`), and incremented here ALONE when authority must change with no
@@ -157,6 +165,7 @@ class Heard:
     ttl_ms: int
     heard_ms: int
     assignment_id: str = ""
+    site: str = ""  # the holder's site, as its lease record names it
 
     def live(self, now_ms: int) -> bool:
         return now_ms - self.heard_ms <= self.ttl_ms
@@ -291,6 +300,9 @@ class State:
     engineer_token: str = ""  # the ENGINEER token the current plant_generation belongs to
     constraint: Constraint | None = None  # the plant constraint in force; never lifted by silence
     last_cause: FenceCause | None = None  # why the gate last fenced alone (#290); None since a COMMIT
+    # Why actuation waits on the plant constraint after a new term (#345); "" when it does not. Lifted
+    # only by restore_constraints finding nothing, or by the live ENGINEER writing under the plant fence.
+    plant_hold: str = ""
     # ---- volatile: lost on restart by design (a reservation does not survive the gate, §4)
     reservation: Reservation | None = None
     boot_ms: int = 0
@@ -362,10 +374,71 @@ class Policy:
 # ---------------------------------------------------------------------------- the transfer
 
 
+HOLD_UNREAD = "plant constraint not yet read from storage after a new term"
+HOLD_RESTORED = "plant constraint restored from storage after a new term: awaiting the ENGINEER's confirmation"
+HOLD_INVALID = "the stored plant constraint is invalid ({why}): awaiting the ENGINEER's record"
+
+
 def fresh(vessel_id: str, now_ms: int, term: str | None = None) -> State:
     """A newly (re)initialised store: a new term, generation 1, no map, the transition state. Every
-    fence from a previous life is from a term that no longer exists."""
-    return State(vessel_id=vessel_id, term=term or new_term(), boot_ms=now_ms)
+    fence from a previous life is from a term that no longer exists -- and so is the plant constraint
+    in force, which `restore_constraints` must read back before anything moves (#345)."""
+    return State(vessel_id=vessel_id, term=term or new_term(), boot_ms=now_ms, plant_hold=HOLD_UNREAD)
+
+
+def constraint_invalid(c: Constraint) -> str:
+    """Why a stored constraint cannot be restored ("" when it can). Its fence is from a term this gate
+    no longer has, so only its shape is checked: a term of 16 bytes of hex, a positive revision, and
+    each device named once, with a cap that is a percentage."""
+    if len(c.fence.term) != 32 or any(ch not in "0123456789abcdef" for ch in c.fence.term.lower()):
+        return "its term is not 16 bytes of hex"
+    if c.revision < 1:
+        return f"revision {c.revision}"
+    ids = [d.device_id for d in c.devices]
+    if any(not i for i in ids):
+        return "a device with no id"
+    if len(set(ids)) != len(ids):
+        return "a device named twice"
+    for d in c.devices:
+        p = d.max_power_pct
+        if p is not None and not 0.0 <= p <= 100.0:  # NaN fails both comparisons
+            return f"{d.device_id}: max_power_pct {p}"
+    return ""
+
+
+def _tightest(records: list[Constraint]) -> tuple[DeviceLimit, ...]:
+    """Every device any record constrains: inhibited if any inhibits it, else the lowest cap."""
+    out: dict[str, DeviceLimit] = {}
+    for c in records:
+        for d in c.devices:
+            cur = out.get(d.device_id)
+            if cur is None:
+                out[d.device_id] = d
+                continue
+            caps = [p for p in (cur.max_power_pct, d.max_power_pct) if p is not None]
+            out[d.device_id] = DeviceLimit(d.device_id, min(caps) if caps else None, cur.inhibit or d.inhibit,
+                                           "; ".join(dict.fromkeys(r for r in (cur.reason, d.reason) if r)))
+    return tuple(out.values())
+
+
+def restore_constraints(st: State, records: list[Constraint], invalid: list[str], now_ms: int) -> tuple[State, str]:
+    """I16 on a new term (#345): what storage held for `propulsion_constraint/{vessel}`, read once after
+    a reinitialised store. `records` are the decoded replies, `invalid` why any other reply could not be
+    decoded. Returns the state and what happened. A gate whose store survived is not on a new term and
+    is left alone (its own constraint is the one in force)."""
+    if st.plant_hold != HOLD_UNREAD:
+        return st, ""
+    bad = list(invalid) + [why for why in map(constraint_invalid, records) if why]
+    if bad:
+        return replace(st, constraint=None, plant_hold=HOLD_INVALID.format(why="; ".join(bad))), "invalid"
+    if not records:
+        return replace(st, plant_hold=""), "none"
+    # Several replies (more than one storage) restore the tightest of them: a restore never relaxes.
+    # Its writer is the live ENGINEER holder if one is heard already, else the record's own.
+    eng = st.leases.get("engineer")
+    who = (eng.holder, eng.site) if eng is not None and eng.live(now_ms) else (records[0].controller_id, records[0].controller_site)
+    c = Constraint(st.plant_fence, 1, who[0], who[1], _tightest(records))
+    return replace(st, constraint=c, plant_hold=HOLD_RESTORED), "restored"
 
 
 def _expire(st: State, now_ms: int) -> State:
@@ -470,7 +543,7 @@ def observe_lease(st: State, slot: str, holder: str, token: str, ttl_ms: int, re
     if released:
         leases.pop(slot, None)
     else:
-        leases[slot] = Heard(holder, token, ttl_ms, now_ms)
+        leases[slot] = Heard(holder, token, ttl_ms, now_ms, site=site)
     st = replace(st, leases=leases)
     if slot == "engineer" and not released and token and token != st.engineer_token:
         st = _new_engineer(st, holder, site, token)
@@ -499,7 +572,11 @@ def observe_constraint(st: State, c: Constraint, now_ms: int) -> tuple[State, bo
     eng = st.leases.get("engineer")
     if eng is None or not eng.live(now_ms) or eng.holder != c.controller_id:
         return st, False, f"{c.controller_id} does not hold a live ENGINEER lease"
-    return replace(st, constraint=c), True, ""
+    if st.plant_hold == HOLD_UNREAD:
+        # Storage has not been read yet: this record cannot be judged against what it may relax.
+        return st, False, "the stored plant constraint has not been read yet"
+    # The live engineer's own record under the new term is the confirmation a restore waits for (#345).
+    return replace(st, constraint=c, plant_hold=""), True, ""
 
 
 def _clamp(st: State, pol: Policy, dof: str, v: float) -> tuple[float, str]:
@@ -550,7 +627,7 @@ def observe_maintenance(st: State, state: int, now_ms: int) -> State:
 
 def actuation_allowed(st: State, pol: Policy, now_ms: int) -> tuple[bool, str]:
     """I6: ACTUATION_ALLOWED ⇒ SafetyState CLEAR ∧ ¬local_lockout ∧ maintenance INACTIVE (∧ the lifecycle
-    permits -- it has no subject yet, so it cannot refuse here). A silent supervisor is not a CLEAR one,
+    permits -- it has no subject yet, so it cannot refuse here) ∧ no plant hold (#345). A silent supervisor is not a CLEAR one,
     and a silent manager is not an INACTIVE one: an unheard or stale maintenance_state is not INACTIVE
     (keelson protocols/maintenance.yaml)."""
     s = st.safety
@@ -572,6 +649,8 @@ def actuation_allowed(st: State, pol: Policy, now_ms: int) -> tuple[bool, str]:
         if m.state != MAINTENANCE_INACTIVE:
             name = MAINTENANCE_STATES.get(m.state, f"state {m.state}")
             return False, f"maintenance_state is {name}: actuation inhibited until it is INACTIVE"
+    if st.plant_hold:
+        return False, st.plant_hold
     return True, ""
 
 

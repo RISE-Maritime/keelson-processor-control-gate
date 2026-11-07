@@ -189,10 +189,31 @@ def main() -> int:
               if maintenance_pb is not None else []),
             session.declare_subscriber(f"{base}/propulsion_constraint/{vessel}", guarded(on_constraint)),
         ]
-        # Stored: a constraint written while this gate was down is still the one in force.
-        for reply in session.get(f"{base}/propulsion_constraint/{vessel}", timeout=2.0):
-            if reply.ok is not None:
-                guarded(on_constraint)(reply.ok)
+        # Stored: a constraint written while this gate was down is still the one in force. On a new
+        # term it is restored and rebased, and actuation waits for the ENGINEER (I16, crowsnest-dev#345).
+        stored, unreadable = [], []
+        try:
+            replies = list(session.get(f"{base}/propulsion_constraint/{vessel}", timeout=2.0))
+        except Exception as e:  # pylint: disable=broad-except
+            # Not "none": a read that failed says nothing about what is in force, so it holds like an
+            # invalid record -- and, like one, the ENGINEER's record under the new term lifts it.
+            replies, unreadable = [], [f"the storage read failed: {e}"]
+        for reply in replies:
+            if reply.ok is None:
+                continue
+            try:
+                pb = _decode(reply.ok, PropulsionConstraint)
+            except Exception as e:  # pylint: disable=broad-except
+                unreadable.append(f"undecodable: {e}")
+                continue
+            c = codec.constraint_from_proto(pb)
+            if pb.vessel_id and pb.vessel_id != vessel:
+                unreadable.append(f"written for vessel {pb.vessel_id!r}")
+            elif c is None:
+                unreadable.append("it carries no fence")
+            else:
+                stored.append(c)
+        gate.restore_constraints(stored, unreadable)
 
         def parse(cls, op):
             msg = cls()

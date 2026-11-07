@@ -155,7 +155,12 @@ class Gate:
         with self.lock:
             if c is None:
                 return False, "no fence"
+            held = self.state.plant_hold
             st, ok, why = model.observe_constraint(self.state, c, self.now_ms())
+            if ok and held:
+                log.warning("the ENGINEER %s confirmed the plant constraint at revision %d: the hold is lifted",
+                            c.controller_id, c.revision)
+                self.events.append(f"plant hold lifted by {c.controller_id}")
             if ok:
                 self.store.save(st)
                 log.info("propulsion_constraint revision %d by %s: %s", c.revision, c.controller_id,
@@ -164,6 +169,30 @@ class Gate:
                 log.info("propulsion_constraint revision %d by %s dropped: %s", c.revision, c.controller_id, why)
             self.state = st
             return ok, why
+
+    def restore_constraints(self, records: list, invalid: list[str]) -> str:
+        """What storage held for `propulsion_constraint/{vessel}`, read once after boot (#345). On a new
+        term it is validated and rebased, and the rebased record is published so storage holds it under
+        the new term; on a surviving store it is an ordinary record, judged by `observe_constraint`."""
+        with self.lock:
+            st, what = model.restore_constraints(self.state, records, invalid, self.now_ms())
+            if not what:
+                for c in records:
+                    self.observe_constraint(c)
+                return ""
+            self.store.save(st)  # durable before anything is clamped or published under it
+            self.state = st
+            if what == "restored":
+                devs = ", ".join(f"{d.device_id} {'inhibited' if d.inhibit else d.max_power_pct}" for d in st.constraint.devices)
+                log.warning("RESTORED propulsion_constraint after a new term (%s), rebased at revision 1; "
+                            "actuation held until the ENGINEER confirms", devs or "no devices")
+                self.outbox.append(st.constraint)
+            elif what == "invalid":
+                log.error("the stored propulsion_constraint cannot be restored: %s", st.plant_hold)
+            else:
+                log.info("no stored propulsion_constraint after a new term: none in force")
+            self.events.append(f"plant constraint {what} after a new term")
+            return what
 
     def take_publications(self) -> list:
         with self.lock:

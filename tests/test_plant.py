@@ -28,6 +28,7 @@ def clock():
 def make(tmp_path, clock):
     g = Gate(store=Store(tmp_path / "gate.sqlite"), policy=POL, vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
     g.boot()
+    g.restore_constraints([], [])  # storage holds none (#345)
     return g
 
 
@@ -77,6 +78,7 @@ def test_the_transition_value_is_clamped_too(tmp_path, clock):
     pol = replace(POL, transition_values={"throttle": 60.0})
     g = Gate(store=Store(tmp_path / "gate.sqlite"), policy=pol, vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
     g.boot()
+    g.restore_constraints([], [])  # storage holds none (#345)
     clear(g)
     engineer(g)
     derate(g)

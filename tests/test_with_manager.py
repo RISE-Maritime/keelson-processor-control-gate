@@ -74,6 +74,7 @@ def pair(tmp_path):
     gate = Gate(store=Store(tmp_path / "gate.sqlite"), policy=parse({"dofs": DOFS, "automation_sources": ["navigation/0"]}),
                 vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
     gate.boot()
+    gate.restore_constraints([], [])  # storage holds none (#345)
     gate.observe_safety(g.SAFETY_CLEAR, False)
     gate.observe_maintenance(g.MAINTENANCE_INACTIVE)
     bus = Bus()
@@ -152,6 +153,7 @@ def plant(tmp_path):
                                                                      "propulsion": {"throttle": "stbd"}}),
                 vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
     gate.boot()
+    gate.restore_constraints([], [])  # storage holds none (#345)
     gate.observe_safety(g.SAFETY_CLEAR, False)
     gate.observe_maintenance(g.MAINTENANCE_INACTIVE)
     bus = AllLeases()
@@ -215,6 +217,7 @@ def test_an_abort_the_gate_ran_alone_is_completed_by_the_manager_at_reconcile(tm
     gate = Gate(store=Store(tmp_path / "gate.sqlite"), policy=parse({"dofs": DOFS, "automation_sources": ["navigation/0"]}),
                 vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
     gate.boot()
+    gate.restore_constraints([], [])  # storage holds none (#345)
     gate.observe_safety(g.SAFETY_CLEAR, False)
     gate.observe_maintenance(g.MAINTENANCE_INACTIVE)
     bus = AllLeases()

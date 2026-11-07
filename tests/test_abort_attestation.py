@@ -61,6 +61,7 @@ def policy(**att):
 def make(tmp_path, clock, pol):
     g = Gate(store=Store(tmp_path / "gate.sqlite"), policy=pol, vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
     g.boot()
+    g.restore_constraints([], [])  # storage holds none (#345)
     clear(g)
     lease(g)
     Helm(g, clock).all(0)
@@ -232,6 +233,7 @@ def test_a_restart_forgets_every_challenge(tmp_path, clock):
     c = challenge_of(g, clock)
     reborn = Gate(store=Store(tmp_path / "gate.sqlite"), policy=policy(), vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
     reborn.boot()
+    reborn.restore_constraints([], [])  # storage holds none (#345)
     ok, detail, _ = reborn.abort_direct(codec.direct_abort_from_proto(Roc().sign(request(), c)))
     assert not ok and "not one this gate issued" in detail
 
