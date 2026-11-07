@@ -45,6 +45,11 @@ MAINTENANCE_INACTIVE = 1
 MAINTENANCE_STATES = {0: "UNSPECIFIED", 1: "INACTIVE", 2: "REQUESTED", 3: "PREPARING", 4: "MAINTENANCE",
                       5: "READY_FOR_CHECK"}
 
+# keelson.HealthLevel, as a helm reports ITSELF on ControlCandidate.device_health (crowsnest-dev#309).
+# Named for the log only: no decision here reads a sample's health.
+HEALTH_DEGRADED = 3
+HEALTH_LEVELS = {0: "UNKNOWN", 1: "INACTIVE", 2: "CRITICAL", 3: "DEGRADED", 4: "NOMINAL", 5: "NOT_ADVERTISED"}
+
 ACTIVE, STALE, TRANSITION, INHIBITED, UNMAPPED = "ACTIVE", "STALE", "TRANSITION", "INHIBITED", "UNMAPPED"
 
 
@@ -204,6 +209,10 @@ class Sample:
     published_ns: int | None = field(default=None, compare=False)  # t2, the source's clock
     clock_quality: int = field(default=0, compare=False)  # keelson.ClockQuality
     recv_wall_ns: int | None = field(default=None, compare=False)  # t3, this gate's wall clock
+    # The helm's OWN word about itself (crowsnest-dev#309), copied onto ResolvedDof like the
+    # provenance and as little judged: a DEGRADED helm is accepted exactly as a NOMINAL one would be.
+    profile_version: str = field(default="", compare=False)  # the calibration that shaped value_pct
+    device_health: int = field(default=0, compare=False)  # keelson.HealthLevel, its own read watchdog
 
 
 @dataclass(frozen=True)

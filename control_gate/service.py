@@ -53,6 +53,7 @@ class Gate:
         self.sequence = 0  # ResolvedControl's, per incarnation of this process
         self.group_sequences: dict[str, int] = {}
         self.last_cycle: Cycle | None = None
+        self.helm_health: dict[str, int] = {}  # source -> its last accepted sample's own device_health (#309)
         self.outbox: list = []  # plant constraints the gate rebased, for bin/ to publish (take_publications)
 
     def boot(self) -> model.State:
@@ -156,7 +157,23 @@ class Gate:
     def sample(self, s: Sample) -> tuple[bool, str]:
         with self.lock:
             self.state, ok, why = model.on_sample(self.state, self.policy, s, self.now_ms())
+            if ok:
+                self._note_health(s)
             return ok, why
+
+    def _note_health(self, s: Sample) -> None:
+        """Log a helm entering or leaving its own DEGRADED (crowsnest-dev#309), once per transition, so
+        the log says why its samples are late. Reported, never judged: the sample is already accepted."""
+        was = self.helm_health.get(s.source, 0)
+        self.helm_health[s.source] = s.device_health
+        if s.device_health == was:
+            return
+        name = model.HEALTH_LEVELS.get(s.device_health, f"level {s.device_health}")
+        if s.device_health == model.HEALTH_DEGRADED:
+            log.warning("helm %s reports itself DEGRADED (profile %r): still judged on receipt freshness alone",
+                        s.source, s.profile_version)
+        elif was == model.HEALTH_DEGRADED:
+            log.info("helm %s reports itself %s again", s.source, name)
 
     def guidance(self, g: model.Guidance) -> tuple[bool, str]:
         with self.lock:

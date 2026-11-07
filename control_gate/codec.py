@@ -134,8 +134,10 @@ def _provenance(pb, recv_wall_ns, published_ns) -> dict:
 def sample_from_control_candidate(pb, recv_ms: int, recv_wall_ns: int | None = None,
                                   published_ns: int | None = None) -> model.Sample:
     fence = fence_from_proto(pb.fence) if pb.HasField("fence") else None
+    # The helm's own health and calibration (keelson#382); a build without the fields says nothing.
+    own = dict(profile_version=getattr(pb, "profile_version", ""), device_health=int(getattr(pb, "device_health", 0)))
     return model.Sample(pb.source, pb.dof, float(pb.value_pct), pb.stream.stream_id, int(pb.stream.sequence), recv_ms, fence,
-                        **_provenance(pb, recv_wall_ns, published_ns))
+                        **_provenance(pb, recv_wall_ns, published_ns), **own)
 
 
 def _function_name(value: int) -> str:
@@ -205,3 +207,8 @@ def _put_provenance(d, p, cycle_now_ms) -> None:
             getattr(d, name).FromNanoseconds(ns)
     if cycle_now_ms is not None:
         d.gate_hold_ms = max(0, cycle_now_ms - p.recv_ms)
+    if "source_device_health" in d.DESCRIPTOR.fields_by_name:
+        # The helm's own word about itself (crowsnest-dev#309): copied, never judged. A guidance
+        # candidate says neither, and a build without the fields carries neither.
+        d.source_profile_version = getattr(p, "profile_version", "")
+        d.source_device_health = getattr(p, "device_health", 0)

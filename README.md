@@ -89,6 +89,13 @@ sample has to pass the gate's own test before it reaches actuation.
     `gate_hold_ms`, receipt to this cycle on the gate's monotonic clock. A station times the hops
     from these. They are copied, never judged: they are kept out of a sample's equality, and a test
     proves that two samples differing only there resolve identically.
+  - on an ACTIVE row, the **helm's own word about itself** (crowsnest-dev#309): the accepted
+    sample's `device_health` and `profile_version`, as `source_device_health` and
+    `source_profile_version`. A station can then tell why a helm's samples are late (its own read
+    watchdog says DEGRADED), and a recording can say which calibration shaped the value. The gate
+    logs each helm entering and leaving DEGRADED, once per transition. It **never refuses a
+    DEGRADED helm for being DEGRADED**: validity is receive-side freshness, and a test proves that a
+    DEGRADED sample resolves exactly as a NOMINAL one would.
 
   The message also carries the motion fence, a message sequence and a sequence per coupled group.
 - **A lost store is a new term.** If the store is missing, corrupt or fails its hash, the gate
@@ -155,6 +162,12 @@ stacked on #376. `0.6.0.dev21` does not carry it. On that build every `navigatio
 "no human order in force", so HUMAN_ORDER is still refused: the check fails closed, as before. To
 develop against it, install a local SDK carrying both that branch and the pin's PRs. The joint e2e
 also needs the manager's maintenance PR (#377).
+
+**A helm's health and calibration need `ControlCandidate.device_health` / `profile_version`
+(keelson#382) and `ResolvedDof.source_device_health` / `source_profile_version`** (keelson
+`feat/resolved-dof-device-health`, stacked on #386). `0.6.0.dev21` carries neither: the codec reads
+UNKNOWN and an empty profile, writes nothing, and `tests/test_helm_health.py` skips its two codec
+cases.
 
 ## Not in this cut (#85's later slices)
 
