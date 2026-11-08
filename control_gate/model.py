@@ -263,10 +263,12 @@ class NavStateSeen:
 
 @dataclass(frozen=True)
 class NavDoc:
-    """The navigation authority document, as last heard: revision, and per function (holder, method)."""
+    """The navigation authority document, as last applied: its incarnation (`assignment_id`), revision,
+    and per function (holder, method)."""
 
     revision: int
     functions: dict  # function -> (holder principal, control method 1..5)
+    assignment_id: str = ""
 
 
 CONTROL_METHOD_DELEGATED = 3
@@ -303,6 +305,9 @@ class State:
     # Why actuation waits on the plant constraint after a new term (#345); "" when it does not. Lifted
     # only by restore_constraints finding nothing, or by the live ENGINEER writing under the plant fence.
     plant_hold: str = ""
+    # The last navigation authority revision applied, per document incarnation (assignment_id -> revision).
+    # Durable so a restart does not accept an older document back (I11; NavigationAuthority has no fence).
+    nav_floors: dict = field(default_factory=dict)
     # ---- volatile: lost on restart by design (a reservation does not survive the gate, §4)
     reservation: Reservation | None = None
     boot_ms: int = 0
@@ -703,8 +708,23 @@ def on_sample(st: State, pol: Policy, s: Sample, now_ms: int) -> tuple[State, bo
 # ---------------------------------------------------------------------------- guidance (I15)
 
 
-def observe_navigation(st: State, revision: int, functions: dict) -> State:
-    return replace(st, navigation=NavDoc(int(revision), dict(functions)))
+NAV_FLOORS_KEPT = 8  # incarnations remembered; a document re-issued more often than this is a fault anyway
+
+
+def observe_navigation(st: State, revision: int, functions: dict, assignment_id: str = "") -> tuple[State, bool, str]:
+    """The navigation authority document, applied only at a revision greater than the last applied for
+    the same `assignment_id` (I11; keelson NavigationAuthority.proto). The document has NO motion fence:
+    its validity is the revision, each function's holder lease and the issuer of the command_authority
+    record carrying it -- so revisions 5, 7, 6 apply 5 then 7 and drop 6. A new assignment_id is the
+    document re-issued, a new incarnation with its own revisions."""
+    revision = int(revision)
+    last = st.nav_floors.get(assignment_id)
+    if last is not None and revision <= last:
+        return st, False, f"navigation revision {revision} is not newer than {last} (assignment {assignment_id or '-'})"
+    floors = {k: v for k, v in st.nav_floors.items() if k != assignment_id}
+    floors = dict(list(floors.items())[-(NAV_FLOORS_KEPT - 1):]) if NAV_FLOORS_KEPT > 1 else {}
+    floors[assignment_id] = revision
+    return replace(st, navigation=NavDoc(revision, dict(functions), assignment_id), nav_floors=floors), True, ""
 
 
 def observe_navigation_state(st: State, producer: str, order_id: str | None, recv_ms: int) -> State:

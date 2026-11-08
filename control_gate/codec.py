@@ -165,10 +165,12 @@ def guidance_from_proto(pb, recv_ms: int, recv_wall_ns: int | None = None,
     return model.Guidance(**g)
 
 
-def navigation_from_record(rec) -> tuple[int, dict]:
-    """The navigation authority document on `command_authority/{vessel}/navigation`."""
+def navigation_from_record(rec) -> tuple[int, dict, str]:
+    """The navigation authority document on `command_authority/{vessel}/navigation`: revision, functions,
+    and its incarnation (assignment_id), which scopes the revision (I11)."""
     doc = rec.navigation_authority
-    return int(doc.revision), {_function_name(f.function): (f.holder, int(f.control_method)) for f in doc.functions}
+    return (int(doc.revision), {_function_name(f.function): (f.holder, int(f.control_method)) for f in doc.functions},
+            doc.assignment_id)
 
 
 _STATE = {"ACTIVE": 1, "STALE": 2, "TRANSITION": 3, "INHIBITED": 4, "UNMAPPED": 5}

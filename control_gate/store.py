@@ -116,7 +116,9 @@ class Store:
                        # Why it last fenced alone (#290); absent in an older store, never a new term.
                        last_cause=_cause(d.get("last_cause")),
                        # A restore still waiting for the ENGINEER (#345) waits across a restart too.
-                       plant_hold=str(d.get("plant_hold", "")))
+                       plant_hold=str(d.get("plant_hold", "")),
+                       # The navigation document's revision floor per incarnation (I11); absent in an older store.
+                       nav_floors={str(k): int(v) for k, v in d.get("nav_floors", {}).items()})
         except (ValueError, KeyError, TypeError) as e:
             return fresh(vessel_id, now_ms), f"the stored state is inconsistent: {e}"
         if len(st.term) != 32:
@@ -129,7 +131,8 @@ class Store:
                            "in_transition": st.in_transition, "transition_reason": st.transition_reason,
                            "plant_generation": st.plant_generation, "engineer_token": st.engineer_token,
                            "constraint": _constraint_json(st.constraint),
-                           "last_cause": _cause_json(st.last_cause), "plant_hold": st.plant_hold})
+                           "last_cause": _cause_json(st.last_cause), "plant_hold": st.plant_hold,
+                           "nav_floors": st.nav_floors})
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self.db.executemany("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",

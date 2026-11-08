@@ -243,9 +243,15 @@ class Gate:
                 log.debug("guidance %s %s refused: %s", g.source, g.dof, why)
             return ok, why
 
-    def observe_navigation(self, revision, functions):
+    def observe_navigation(self, revision, functions, assignment_id: str = "") -> tuple[bool, str]:
         with self.lock:
-            self.state = model.observe_navigation(self.state, revision, functions)
+            st, ok, why = model.observe_navigation(self.state, revision, functions, assignment_id)
+            if ok:
+                self.store.save(st)  # the floor is durable: a restart must not take an older document back
+            else:
+                log.info("navigation authority dropped: %s", why)
+            self.state = st
+            return ok, why
 
     def observe_navigation_state(self, producer: str, order_id: str | None):
         with self.lock:
