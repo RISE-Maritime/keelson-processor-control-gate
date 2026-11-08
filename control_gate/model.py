@@ -110,6 +110,29 @@ class Constraint:
         return next((d for d in self.devices if d.device_id == device_id), None)
 
 
+@dataclass(frozen=True)
+class MotionLimit:
+    """One payload's `motion_constraint/{vessel}/{payload_id}` slot (keelson MotionConstraint, #358).
+
+    Its fence is the PAYLOAD GATE's `payload_epoch`, not this gate's. `clears_on` / `release` are
+    ("sensor", key_expr or value) or ("procedure", procedure_id), or None. An unset limit is no limit."""
+
+    payload_id: str
+    fence: Fence
+    revision: int
+    writer_id: str = ""
+    heading_band: tuple[float, float] | None = None
+    max_speed_knots: float | None = None
+    max_rot_degps: float | None = None
+    reason: str = ""
+    latched: bool = False
+    clears_on: tuple[str, str] | None = None
+    release: tuple[str, str] | None = None
+
+    def has_limit(self) -> bool:
+        return self.heading_band is not None or self.max_speed_knots is not None or self.max_rot_degps is not None
+
+
 # keelson GateState.last_fence_cause kinds (crowsnest-dev#290)
 CAUSE_ABORT, CAUSE_CONN_LAPSE, CAUSE_INVALID_SOURCE, CAUSE_LOCAL_FALLBACK = "abort_automation", "conn_lapse", "invalid_source", "local_fallback"
 
@@ -308,6 +331,14 @@ class State:
     # The last navigation authority revision applied, per document incarnation (assignment_id -> revision).
     # Durable so a restart does not accept an older document back (I11; NavigationAuthority has no fence).
     nav_floors: dict = field(default_factory=dict)
+    # motion_constraint, one slot per payload (payload_id -> MotionLimit). Never lifted by silence or a
+    # dead writer (I5): only a record the rules below accept changes a slot.
+    motion: dict = field(default_factory=dict)
+    # Why actuation waits on motion_constraint after a new term ("" when it does not), and the payloads
+    # whose stored record was invalid ("?" when it could not be attributed): each lifts when a valid
+    # record for it is accepted (I16).
+    motion_hold: str = ""
+    motion_pending: tuple[str, ...] = ()
     # ---- volatile: lost on restart by design (a reservation does not survive the gate, §4)
     reservation: Reservation | None = None
     boot_ms: int = 0
@@ -388,7 +419,8 @@ def fresh(vessel_id: str, now_ms: int, term: str | None = None) -> State:
     """A newly (re)initialised store: a new term, generation 1, no map, the transition state. Every
     fence from a previous life is from a term that no longer exists -- and so is the plant constraint
     in force, which `restore_constraints` must read back before anything moves (#345)."""
-    return State(vessel_id=vessel_id, term=term or new_term(), boot_ms=now_ms, plant_hold=HOLD_UNREAD)
+    return State(vessel_id=vessel_id, term=term or new_term(), boot_ms=now_ms, plant_hold=HOLD_UNREAD,
+                 motion_hold=MOTION_UNREAD)
 
 
 def constraint_invalid(c: Constraint) -> str:
@@ -444,6 +476,125 @@ def restore_constraints(st: State, records: list[Constraint], invalid: list[str]
     who = (eng.holder, eng.site) if eng is not None and eng.live(now_ms) else (records[0].controller_id, records[0].controller_site)
     c = Constraint(st.plant_fence, 1, who[0], who[1], _tightest(records))
     return replace(st, constraint=c, plant_hold=HOLD_RESTORED), "restored"
+
+
+# ---------------------------------------------------------------------------- motion_constraint (interim)
+#
+# THE INTERIM (crowsnest-dev#85, Ted 2026-11-08). Two things the protocol does not yet say:
+#   keelson#421 -- how this gate learns a payload's CURRENT payload_epoch. Terms are random and cannot be
+#     ordered, so a record under a fence other than the slot's is applied only if it relaxes NOTHING.
+#   keelson#422 -- how knots, deg/s and a heading band become a DOF's percent. The clamp cannot be done,
+#     so a LATCHED slot with a limit refuses ACTUATION_ALLOWED (fail safe, the transition state) and a
+#     non-latched one is reported, not enforced.
+
+MOTION_UNREAD = "motion_constraint not yet read from storage after a new term"
+MOTION_INVALID = "a stored motion_constraint is invalid ({why}): awaiting a valid record for it"
+MOTION_FENCE_ISSUE = "keelson#421"
+MOTION_UNITS_ISSUE = "keelson#422"
+
+
+def _num_ok(v: float | None, hi: float | None = None) -> bool:
+    return v is None or (v >= 0 and (hi is None or v <= hi))  # NaN fails both comparisons
+
+
+def motion_invalid(m: MotionLimit) -> str:
+    """Why a motion_constraint record cannot be applied ("" when it can): its shape only."""
+    if not m.payload_id:
+        return "no payload id"
+    if len(m.fence.term) != 32 or any(ch not in "0123456789abcdef" for ch in m.fence.term.lower()):
+        return "its payload_epoch term is not 16 bytes of hex"
+    if m.revision < 1:
+        return f"revision {m.revision}"
+    if not _num_ok(m.max_speed_knots) or not _num_ok(m.max_rot_degps):
+        return "a speed or rate-of-turn limit that is negative or not a number"
+    if m.heading_band is not None and not all(_num_ok(x, 360.0) for x in m.heading_band):
+        return "a heading band outside 0-360"
+    if m.latched and m.clears_on is None:
+        return "latched with nothing that clears it"
+    return ""
+
+
+def _span(b: tuple[float, float]) -> float:
+    return (b[1] - b[0]) % 360.0
+
+
+def _in_band(inner: tuple[float, float], outer: tuple[float, float]) -> bool:
+    """Is the clockwise band `inner` within the clockwise band `outer` (degrees, wrapping through north)?"""
+    return (inner[0] - outer[0]) % 360.0 + _span(inner) <= _span(outer) + 1e-9
+
+
+def motion_relaxes(cur: MotionLimit, new: MotionLimit) -> str:
+    """What `new` would relax against `cur` ("" when it relaxes nothing): a limit removed or loosened,
+    a band widened, or a latch dropped."""
+    for name, a, b in (("max_speed_knots", cur.max_speed_knots, new.max_speed_knots),
+                       ("max_rate_of_turn_degps", cur.max_rot_degps, new.max_rot_degps)):
+        if a is not None and (b is None or b > a):
+            return f"{name} {a:g} -> {'unset' if b is None else f'{b:g}'}"
+    if cur.heading_band is not None and (new.heading_band is None or not _in_band(new.heading_band, cur.heading_band)):
+        return "the heading band widened"
+    if cur.latched and not new.latched:
+        return "the latch lifted"
+    return ""
+
+
+def _release_matches(cur: MotionLimit, new: MotionLimit) -> bool:
+    """A latch lifts only by a release whose kind (and, for a procedure, id) matches `clears_on`."""
+    if new.release is None or cur.clears_on is None:
+        return False
+    kind, what = cur.clears_on
+    return new.release[0] == kind and (kind != "procedure" or new.release[1] == what)
+
+
+def observe_motion(st: State, m: MotionLimit) -> tuple[State, bool, str]:
+    """One motion_constraint record, by the interim's rules (above): I11 under one fence, a latch that
+    outlives its writer and lifts only by a matching release (I5), and nothing relaxed under a fence
+    this gate cannot judge current (keelson#421)."""
+    if st.motion_hold == MOTION_UNREAD:
+        return st, False, "the stored motion constraints have not been read yet"
+    bad = motion_invalid(m)
+    if bad:
+        return st, False, f"invalid: {bad}"
+    cur = st.motion.get(m.payload_id)
+    if cur is not None:
+        relax = motion_relaxes(cur, m)
+        if m.fence == cur.fence:
+            if m.revision <= cur.revision:
+                return st, False, f"revision {m.revision} is not newer than {cur.revision}"
+            if cur.latched and relax and not _release_matches(cur, m):
+                return st, False, f"a latched constraint is relaxed only by a release matching what clears it ({relax})"
+        elif relax:
+            return st, False, f"under a payload_epoch this gate cannot judge current, it would relax: {relax} ({MOTION_FENCE_ISSUE})"
+    pending = tuple(p for p in st.motion_pending if p not in (m.payload_id, "?"))
+    hold = st.motion_hold if pending else ""
+    return replace(st, motion={**st.motion, m.payload_id: m}, motion_pending=pending, motion_hold=hold), True, ""
+
+
+def restore_motion(st: State, records: list[MotionLimit], invalid: list[tuple[str, str]]) -> tuple[State, str]:
+    """I16 for motion_constraint: what storage held, read once after a new term. Valid slots are kept as
+    they were (their fence is the payload gate's, not this term's); a latched one keeps actuation
+    refused by `actuation_allowed`. An invalid one -- `invalid` is (payload_id or "?", why) -- holds
+    actuation until a valid record for that payload is accepted."""
+    if st.motion_hold != MOTION_UNREAD:
+        return st, ""
+    bad = list(invalid) + [(r.payload_id or "?", why) for r in records if (why := motion_invalid(r))]
+    good = {r.payload_id: r for r in records if not motion_invalid(r)}
+    if bad:
+        why = "; ".join(f"{p}: {w}" for p, w in bad)
+        return replace(st, motion=good, motion_hold=MOTION_INVALID.format(why=why),
+                       motion_pending=tuple(dict.fromkeys(p for p, _ in bad))), "invalid"
+    return replace(st, motion=good, motion_hold="", motion_pending=()), "restored" if good else "none"
+
+
+def motion_refusal(st: State) -> str:
+    """Why motion_constraint refuses actuation ("" when it does not): a hold after a new term, or a
+    latched slot with a limit this gate cannot yet enforce (keelson#422)."""
+    if st.motion_hold:
+        return st.motion_hold
+    for pid, m in sorted(st.motion.items()):
+        if m.latched and m.has_limit():
+            why = f": {m.reason}" if m.reason else ""
+            return f"latched motion_constraint {pid}{why} -- not enforceable until {MOTION_UNITS_ISSUE}"
+    return ""
 
 
 def _expire(st: State, now_ms: int) -> State:
@@ -656,6 +807,9 @@ def actuation_allowed(st: State, pol: Policy, now_ms: int) -> tuple[bool, str]:
             return False, f"maintenance_state is {name}: actuation inhibited until it is INACTIVE"
     if st.plant_hold:
         return False, st.plant_hold
+    motion = motion_refusal(st)
+    if motion:
+        return False, motion
     return True, ""
 
 

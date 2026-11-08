@@ -194,6 +194,50 @@ class Gate:
             self.events.append(f"plant constraint {what} after a new term")
             return what
 
+    def observe_motion(self, m: model.MotionLimit | None) -> tuple[bool, str]:
+        """A motion_constraint record, by the interim's rules (model.observe_motion). Persisted when
+        applied: a latched slot outlives this gate's restart as it outlives its writer (I5)."""
+        with self.lock:
+            if m is None:
+                return False, "no fence"
+            held = self.state.motion_hold
+            st, ok, why = model.observe_motion(self.state, m)
+            if ok:
+                self.store.save(st)
+                limits = ", ".join(x for x in (
+                    f"speed <= {m.max_speed_knots:g} kn" if m.max_speed_knots is not None else "",
+                    f"rot <= {m.max_rot_degps:g} deg/s" if m.max_rot_degps is not None else "",
+                    f"heading {m.heading_band[0]:g}-{m.heading_band[1]:g}" if m.heading_band is not None else "") if x) or "none"
+                log.warning("motion_constraint %s revision %d by %s%s: %s%s", m.payload_id, m.revision, m.writer_id,
+                            " LATCHED" if m.latched else "", limits,
+                            "" if m.latched or not m.has_limit() else f" -- reported, NOT enforced ({model.MOTION_UNITS_ISSUE})")
+                if held and not st.motion_hold:
+                    self.events.append("motion hold lifted")
+            else:
+                log.info("motion_constraint %s revision %d dropped: %s", m.payload_id, m.revision, why)
+            self.state = st
+            return ok, why
+
+    def restore_motion(self, records: list, invalid: list) -> str:
+        """What storage held for `motion_constraint/{vessel}/*`, read once after boot (I16). On a new term
+        the valid slots are restored as they were and an invalid one holds actuation; on a surviving
+        store each record is an ordinary one, judged by `observe_motion`."""
+        with self.lock:
+            st, what = model.restore_motion(self.state, records, invalid)
+            if not what:
+                for m in records:
+                    self.observe_motion(m)
+                return ""
+            self.store.save(st)
+            self.state = st
+            if what == "invalid":
+                log.error("a stored motion_constraint cannot be restored: %s", st.motion_hold)
+            elif what == "restored":
+                log.warning("RESTORED motion_constraint after a new term: %s", ", ".join(
+                    f"{p}{' LATCHED' if m.latched else ''}" for p, m in sorted(st.motion.items())))
+            self.events.append(f"motion constraints {what} after a new term")
+            return what
+
     def take_publications(self) -> list:
         with self.lock:
             out, self.outbox = self.outbox, []

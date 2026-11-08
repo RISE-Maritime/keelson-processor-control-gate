@@ -35,6 +35,7 @@ def make(tmp_path, clock, policy=POL):
     g = Gate(store=Store(tmp_path / "gate.sqlite"), policy=policy, vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
     g.boot()
     g.restore_constraints([], [])  # storage holds none (#345)
+    g.restore_motion([], [])  # nor any motion_constraint (#85)
     return g
 
 

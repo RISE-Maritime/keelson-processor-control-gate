@@ -21,7 +21,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .model import Constraint, DeviceLimit, Fence, FenceCause, Mapping, State, fresh
+from .model import Constraint, DeviceLimit, Fence, FenceCause, Mapping, MotionLimit, State, fresh
 
 SCHEMA_VERSION = 1
 
@@ -53,6 +53,24 @@ def _constraint(d) -> Constraint | None:
         return None
     return Constraint(Fence(d["fence"][0], int(d["fence"][1])), int(d["revision"]), d["controller_id"], d["controller_site"],
                       tuple(DeviceLimit(x[0], None if x[1] is None else float(x[1]), bool(x[2]), x[3]) for x in d["devices"]))
+
+
+def _motion_json(m: MotionLimit) -> dict:
+    return {"payload_id": m.payload_id, "fence": [m.fence.term, m.fence.generation], "revision": m.revision,
+            "writer_id": m.writer_id, "heading_band": None if m.heading_band is None else list(m.heading_band),
+            "max_speed_knots": m.max_speed_knots, "max_rot_degps": m.max_rot_degps, "reason": m.reason,
+            "latched": m.latched, "clears_on": None if m.clears_on is None else list(m.clears_on),
+            "release": None if m.release is None else list(m.release)}
+
+
+def _motion(d: dict) -> MotionLimit:
+    opt = lambda v: None if v is None else float(v)  # noqa: E731
+    pair = lambda v: None if v is None else (str(v[0]), str(v[1]))  # noqa: E731
+    band = d.get("heading_band")
+    return MotionLimit(d["payload_id"], Fence(d["fence"][0], int(d["fence"][1])), int(d["revision"]), d.get("writer_id", ""),
+                       None if band is None else (float(band[0]), float(band[1])), opt(d.get("max_speed_knots")),
+                       opt(d.get("max_rot_degps")), d.get("reason", ""), bool(d.get("latched", False)),
+                       pair(d.get("clears_on")), pair(d.get("release")))
 
 
 def _cause_json(c: FenceCause | None):
@@ -118,7 +136,12 @@ class Store:
                        # A restore still waiting for the ENGINEER (#345) waits across a restart too.
                        plant_hold=str(d.get("plant_hold", "")),
                        # The navigation document's revision floor per incarnation (I11); absent in an older store.
-                       nav_floors={str(k): int(v) for k, v in d.get("nav_floors", {}).items()})
+                       nav_floors={str(k): int(v) for k, v in d.get("nav_floors", {}).items()},
+                       # motion_constraint slots and their hold (#85): a latched slot outlives a restart as it
+                       # outlives its writer (I5). Absent in an older store: none, never a new term.
+                       motion={m["payload_id"]: _motion(m) for m in d.get("motion", [])},
+                       motion_hold=str(d.get("motion_hold", "")),
+                       motion_pending=tuple(d.get("motion_pending", [])))
         except (ValueError, KeyError, TypeError) as e:
             return fresh(vessel_id, now_ms), f"the stored state is inconsistent: {e}"
         if len(st.term) != 32:
@@ -132,7 +155,9 @@ class Store:
                            "plant_generation": st.plant_generation, "engineer_token": st.engineer_token,
                            "constraint": _constraint_json(st.constraint),
                            "last_cause": _cause_json(st.last_cause), "plant_hold": st.plant_hold,
-                           "nav_floors": st.nav_floors})
+                           "nav_floors": st.nav_floors,
+                           "motion": [_motion_json(m) for _, m in sorted(st.motion.items())],
+                           "motion_hold": st.motion_hold, "motion_pending": list(st.motion_pending)})
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self.db.executemany("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",

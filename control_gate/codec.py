@@ -30,6 +30,32 @@ def constraint_from_proto(pb) -> model.Constraint | None:
     return model.Constraint(fence, int(pb.revision), pb.controller_id, pb.controller_site, devices)
 
 
+def motion_from_proto(pb) -> model.MotionLimit | None:
+    """A `MotionConstraint`, or None when it carries no fence (never applied). Unset limits stay None:
+    an absent limit is no limit, never 0 (explicit presence)."""
+    if not pb.HasField("fence"):
+        return None
+    band = (float(pb.heading_band.min_deg), float(pb.heading_band.max_deg)) if pb.HasField("heading_band") else None
+    clears = None
+    kind = pb.clears_on.WhichOneof("condition") if pb.HasField("clears_on") else None
+    if kind == "sensor":
+        clears = ("sensor", pb.clears_on.sensor.key_expr)
+    elif kind == "procedure_id":
+        clears = ("procedure", pb.clears_on.procedure_id)
+    release = None
+    ev = pb.release.WhichOneof("evidence") if pb.HasField("release") else None
+    if ev == "sensor":
+        release = ("sensor", pb.release.sensor.value)
+    elif ev == "procedure":
+        release = ("procedure", pb.release.procedure.procedure_id)
+    return model.MotionLimit(
+        payload_id=pb.payload_id, fence=fence_from_proto(pb.fence), revision=int(pb.revision), writer_id=pb.writer_id,
+        heading_band=band,
+        max_speed_knots=float(pb.max_speed_knots) if pb.HasField("max_speed_knots") else None,
+        max_rot_degps=float(pb.max_rate_of_turn_degps) if pb.HasField("max_rate_of_turn_degps") else None,
+        reason=pb.reason, latched=bool(pb.latched), clears_on=clears, release=release)
+
+
 def constraint_to_proto(c: model.Constraint, vessel_id: str, ts) -> PropulsionConstraint:
     out = PropulsionConstraint(vessel_id=vessel_id, controller_id=c.controller_id, controller_site=c.controller_site,
                                fence=fence_to_proto(c.fence), revision=c.revision)

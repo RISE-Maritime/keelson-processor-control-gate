@@ -29,6 +29,7 @@ def reborn(tmp_path, clock, pol=POL):
     """A gate whose store was lost: it boots on a new term and has not yet read storage."""
     g = Gate(store=Store(tmp_path / "gate.sqlite"), policy=pol, vessel_id=V, actuator=LoggingActuator(), now_ms=clock)
     g.boot()
+    g.restore_motion([], [])  # no motion_constraint stored: this file is about the plant (#85 has its own)
     return g
 
 

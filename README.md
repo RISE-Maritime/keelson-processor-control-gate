@@ -151,6 +151,27 @@ sample has to pass the gate's own test before it reaches actuation.
     - **The hold is persisted,** so a gate restarted before the confirmation keeps waiting. The
       reason is `actuation_reason` on `resolved_control`.
 
+- **The navigation authority document applies only at a newer revision** (I11, crowsnest-dev#85).
+  keelson's `NavigationAuthority` has no motion fence, so its revision is judged within its
+  incarnation (`assignment_id`): revisions 5, 7, 6 apply 5 then 7 and drop 6. A new `assignment_id`
+  is the document re-issued, with its own revisions. The floors are persisted, so a restart does not
+  take an older document back from storage.
+- **`motion_constraint`, an interim** (crowsnest-dev#85; keelson#421, keelson#422). One slot per
+  payload, `motion_constraint/{vessel}/{payload_id}`, subscribed and read from storage at boot.
+  - **I11 under one fence:** a revision applies only if it is newer than the slot's.
+  - **The latch outlives its writer (I5):** nothing expires a slot. A latch lifts only by a newer
+    revision carrying a `release` that matches `clears_on`: sensor for sensor, the same procedure id.
+  - **A fence this gate cannot judge:** keelson does not yet say how the motion gate learns a payload's
+    current `payload_epoch` (keelson#421), and terms cannot be ordered. A record under another fence is
+    applied only if it relaxes nothing: every limit as tight or tighter, the band no wider, a latch kept.
+  - **No clamp yet:** nothing converts knots, deg/s or a heading band into a DOF's percent
+    (keelson#422). So a **latched** slot with a limit refuses ACTUATION_ALLOWED, and the gate enters its
+    transition state. This is deliberately severe: no motion while a payload's latch is live. A
+    non-latched slot is logged as reported and not enforced.
+  - **I16:** a new term holds until storage is read. Valid slots are restored as they were (their fence
+    is the payload gate's). An invalid or unreadable one holds actuation until a valid record for that
+    payload is accepted. The slots and the hold are persisted.
+
 ## Keys
 
 | Serves / hears | |
@@ -166,6 +187,7 @@ sample has to pass the gate's own test before it reaches actuation.
 | hears `command_authority/{vessel}/engineer` | a new ENGINEER token mints `plant_generation` |
 | hears `propulsion_constraint/{vessel}` (and reads storage at boot) | the plant constraint, under the plant fence |
 | publishes `propulsion_constraint/{vessel}` | only on a new ENGINEER holder: the inherited constraint at revision 1 |
+| hears `motion_constraint/{vessel}/*` (and reads storage at boot) | one slot per payload; the interim (above): a latched one refuses actuation |
 | publishes `resolved_control/{vessel}` | every cycle: the rolling acknowledgement, and the direct abort's attestation challenge |
 
 The policy's `attestation` block, the same shape as the manager's:
@@ -224,15 +246,17 @@ fields. To develop against it, regenerate that branch's `ControlGate`, `Resolved
 
 ## Not in this cut (#85's later slices)
 
-- **HUMAN_ORDER verification**, which needs an order id on `navigation_state`.
-- **Comparing a function envelope (knots) with a DOF's percent.** The DOF's execution envelope still
-  bounds the value.
-- **Each navigation function's `holder_lease_id`**, and its `comms_loss_behaviour` when that lapses.
-- **`motion_constraint`**, and keeping a latched one when its writer dies (I5). `propulsion_constraint`
-  clamping and the ENGINEER handover are done (crowsnest-dev#270).
-- **I16 for a latched `motion_constraint`** through a reincarnation, once the gate reads it at all.
-- **The rest of the §3.2 watchdogs:** `CONTROL_LINK_HEALTH`, `CONTROLLER_SUPERVISION_CHANNEL_HEALTH`,
-  payload-gate liveliness, supervisor liveliness in `operational`, and
-  `on_safety_supervisor_loss_while_active`.
-- **The lifecycle** in ACTUATION_ALLOWED. Arm-path refusals for the legacy interfaces.
-- **Accepting stored control-plane state** only under the current fence and a newer `revision`.
+- **The motion_constraint clamp**, and comparing a function envelope (knots) with a DOF's percent:
+  keelson#422. Until then a latched motion_constraint refuses actuation (above).
+- **Judging a payload's current `payload_epoch`:** keelson#421. Until then nothing is relaxed under a
+  fence the gate cannot judge.
+- **Each navigation function's `holder_lease_id`**, and its `comms_loss_behaviour` when that lapses: a
+  process holder's liveliness key is keelson#424; the timeout is on keelson#363.
+- **The rest of the §3.2 watchdogs:**
+  - `CONTROL_LINK_HEALTH` (what to watch: keelson#423);
+  - `CONTROLLER_SUPERVISION_CHANNEL_HEALTH` (keelson#380);
+  - payload-gate liveliness;
+  - supervisor liveliness in `operational`;
+  - `on_safety_supervisor_loss_while_active` (policy on keelson#363).
+- **The lifecycle** in ACTUATION_ALLOWED (keelson#425). Arm-path refusals for the legacy interfaces are
+  mavlink2keelson's (keelson `feat/maintenance-gated-writes`).

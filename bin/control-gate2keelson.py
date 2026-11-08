@@ -30,6 +30,7 @@ from keelson.payloads.ControlCandidate_pb2 import ControlCandidate
 from keelson.payloads.GuidanceCandidate_pb2 import GuidanceCandidate
 from keelson.payloads.ControlMapping_pb2 import TransferCommit, TransferPrepare
 from keelson.payloads.NavigationState_pb2 import NavigationState
+from keelson.payloads.MotionConstraint_pb2 import MotionConstraint
 from keelson.payloads.PropulsionConstraint_pb2 import PropulsionConstraint
 from keelson.payloads.SafetyState_pb2 import SafetyState
 from keelson.scaffolding import add_common_arguments, create_zenoh_config, setup_logging
@@ -149,6 +150,13 @@ def main() -> int:
         def on_constraint(sample):
             gate.observe_constraint(codec.constraint_from_proto(_decode(sample, PropulsionConstraint)))
 
+        def on_motion(sample):
+            pb = _decode(sample, MotionConstraint)
+            if pb.vessel_id and pb.vessel_id != vessel:
+                log.warning("motion_constraint for vessel %r ignored", pb.vessel_id)
+                return
+            gate.observe_motion(codec.motion_from_proto(pb))
+
         def guarded(fn):
             def run(sample):
                 try:
@@ -188,6 +196,8 @@ def main() -> int:
             *([session.declare_subscriber(f"{base}/maintenance_state/{vessel}", guarded(on_maintenance))]
               if maintenance_pb is not None else []),
             session.declare_subscriber(f"{base}/propulsion_constraint/{vessel}", guarded(on_constraint)),
+            # One slot per payload (keelson MotionConstraint): the interim's rules, crowsnest-dev#85.
+            session.declare_subscriber(f"{base}/motion_constraint/{vessel}/*", guarded(on_motion)),
         ]
         # Stored: a constraint written while this gate was down is still the one in force. On a new
         # term it is restored and rebased, and actuation waits for the ENGINEER (I16, crowsnest-dev#345).
@@ -214,6 +224,31 @@ def main() -> int:
             else:
                 stored.append(c)
         gate.restore_constraints(stored, unreadable)
+
+        # The same for motion_constraint (I16): every payload's slot, read once. A latched slot written
+        # while this gate was down is still in force -- the sonar is still in the water.
+        motion, bad_motion = [], []
+        try:
+            motion_replies = list(session.get(f"{base}/motion_constraint/{vessel}/*", timeout=2.0))
+        except Exception as e:  # pylint: disable=broad-except
+            motion_replies, bad_motion = [], [("?", f"the storage read failed: {e}")]
+        for reply in motion_replies:
+            if reply.ok is None:
+                continue
+            payload = str(reply.ok.key_expr).rsplit("/", 1)[-1] or "?"
+            try:
+                pb = _decode(reply.ok, MotionConstraint)
+            except Exception as e:  # pylint: disable=broad-except
+                bad_motion.append((payload, f"undecodable: {e}"))
+                continue
+            m = codec.motion_from_proto(pb)
+            if pb.vessel_id and pb.vessel_id != vessel:
+                bad_motion.append((payload, f"written for vessel {pb.vessel_id!r}"))
+            elif m is None:
+                bad_motion.append((payload, "it carries no fence"))
+            else:
+                motion.append(m)
+        gate.restore_motion(motion, bad_motion)
 
         def parse(cls, op):
             msg = cls()
