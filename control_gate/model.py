@@ -47,6 +47,11 @@ OVERALL, NAVIGATIONAL = "overall", "navigational"
 # keelson.SafetyState.State
 SAFETY_CLEAR = 1
 
+# keelson.StartWarning.State (keelson #428): a start needs SATISFIED or NOT_FITTED; everything else holds it.
+START_WARNING_NOT_FITTED = 1
+START_WARNING_SATISFIED = 4
+START_WARNING_NAMES = {0: "UNSPECIFIED", 1: "NOT_FITTED", 2: "IDLE", 3: "SOUNDING", 4: "SATISFIED", 5: "FAULT"}
+
 # keelson.MaintenanceState.State (keelson#377): only INACTIVE lets her move. The names are for the reason a
 # DOF is INHIBITED, so an operator reads which step of the procedure is holding her.
 MAINTENANCE_INACTIVE = 1
@@ -206,6 +211,7 @@ class SafetySeen:
     state: int
     local_lockout: bool
     heard_ms: int
+    start_warning: int = START_WARNING_NOT_FITTED  # an absent record is a supervisor that predates it
 
 
 @dataclass(frozen=True)
@@ -651,6 +657,10 @@ def prepare(st: State, pol: Policy, p: Proposal, now_ms: int) -> tuple[State, Ac
                 reasons.append(f"{m.dof}: {why}")
         if bad:
             return st, Ack(False, None, "; ".join(reasons), tuple(bad))
+        # Nothing mapped to a first mapping: a start. Refused here, so a transfer never fails half way.
+        held = start_refusal(st, pol, now_ms) if not st.mappings else None
+        if held:
+            return st, Ack(False, None, held)
     fence = Fence(st.term, st.generation + 1)
     return replace(st, reservation=Reservation(p, fence, now_ms + p.prepare_ttl_ms)), Ack(True, fence)
 
@@ -773,8 +783,26 @@ def observe_assignments(st: State, overall: AssignmentSeen | None, navigational:
     return replace(st, assignments=assignments, feed=Heard(issuer, "", feed_ttl_ms, now_ms))
 
 
-def observe_safety(st: State, state: int, local_lockout: bool, now_ms: int) -> State:
-    return replace(st, safety=SafetySeen(state, local_lockout, now_ms))
+def observe_safety(st: State, state: int, local_lockout: bool, now_ms: int, start_warning: int | None = None) -> State:
+    """`start_warning` None is an absent record, which reads as NOT_FITTED (SafetyState.proto)."""
+    warning = START_WARNING_NOT_FITTED if start_warning is None else start_warning
+    return replace(st, safety=SafetySeen(state, local_lockout, now_ms, warning))
+
+
+def start_refusal(st: State, pol: Policy, now_ms: int) -> str | None:
+    """Why a START must wait for the on-board warning (SARUMS A3.24, keelson #428), or None. A START only:
+    `actuation_allowed` never reads this, so a vessel already under way is never interrupted. NOT_FITTED
+    cannot hold, because nothing could ever satisfy it. A warning the gate cannot read holds."""
+    if not pol.require_safety_state:  # a rig with no supervisor, by policy
+        return None
+    s = st.safety
+    if s is None:
+        return "start held: no safety_state heard, so the on-board warning cannot be read"
+    if now_ms - s.heard_ms > pol.safety_ttl_ms:
+        return "start held: safety_state is stale, so the on-board warning cannot be read"
+    if s.start_warning in (START_WARNING_SATISFIED, START_WARNING_NOT_FITTED):
+        return None
+    return f"start held: the on-board warning is {START_WARNING_NAMES.get(s.start_warning, 'UNSPECIFIED')}"
 
 
 def observe_maintenance(st: State, state: int, now_ms: int) -> State:

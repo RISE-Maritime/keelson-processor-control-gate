@@ -46,6 +46,10 @@ sample has to pass the gate's own test before it reaches actuation.
   a stop or the lockout, the gate emits nothing at all. In the transition state it emits the
   configured value, never an implicit "nobody". A commit forgets every sample accepted under the old
   authority.
+- **A start waits for the on-board warning (crowsnest-dev#377, keelson #428).** The first mapping onto a vessel with
+  none is refused at PREPARE unless `start_warning` is SATISFIED or NOT_FITTED. An absent record reads as NOT_FITTED;
+  anything else, or a `safety_state` unheard or stale, holds the start. It never interrupts a vessel already under
+  way: a handover and every running cycle ignore it. Legacy `arm` does not come through the gate.
 - **ACTUATION_ALLOWED ⇒ maintenance_state INACTIVE (crowsnest-dev#302).** Any other state of the
   procedure inhibits every DOF, with a reason that names it ("maintenance_state is PREPARING: …"). So do
   a record older than `maintenance_ttl_ms` (15 s: three of the manager's heartbeats) and an unheard one:

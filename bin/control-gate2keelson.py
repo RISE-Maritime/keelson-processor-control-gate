@@ -142,7 +142,7 @@ def main() -> int:
 
         def on_safety(sample):
             s = _decode(sample, SafetyState)
-            gate.observe_safety(int(s.state), bool(s.local_lockout))
+            gate.observe_safety(int(s.state), bool(s.local_lockout), int(s.start_warning.state) if s.HasField("start_warning") else None)
 
         def on_maintenance(sample):
             gate.observe_maintenance(int(_decode(sample, maintenance_pb).state))

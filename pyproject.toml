@@ -14,7 +14,7 @@ dependencies = [
     # them all, tracked by crowsnest-dev #85.
     # PENDING: the build has not been cut yet; until it is, develop against a local merge of those
     # branches (README, "Developing before the build").
-    "keelson==0.6.0.dev21",
+    "keelson==0.6.0.dev25",
     # Ed25519 for the ROC service's attestation on the direct abort (crowsnest-dev#316), the
     # authority manager's pin.
     "cryptography==50.0.2",

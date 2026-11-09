@@ -251,9 +251,9 @@ class Gate:
         with self.lock:
             self.state = model.observe_assignments(self.state, overall, navigational, issuer, feed_ttl_ms, self.now_ms())
 
-    def observe_safety(self, state, local_lockout):
+    def observe_safety(self, state, local_lockout, start_warning=None):
         with self.lock:
-            self.state = model.observe_safety(self.state, state, local_lockout, self.now_ms())
+            self.state = model.observe_safety(self.state, state, local_lockout, self.now_ms(), start_warning)
 
     def observe_maintenance(self, state):
         with self.lock:

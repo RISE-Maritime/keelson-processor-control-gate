@@ -126,6 +126,7 @@ def test_a_proposal_that_names_a_fence_is_refused(tmp_path, clock):
 
 def test_an_orphaned_prepare_lapses_on_the_gates_clock(tmp_path, clock):
     g = make(tmp_path, clock)
+    clear(g)
     Helm(g, clock).all(0)
     ack = g.prepare(Proposal("t1", model.GRANT, rows(), "ROC-1", 2000))
     assert not g.prepare(Proposal("t2", model.GRANT, rows(), "ROC-1", 2000)).accepted  # one at a time
