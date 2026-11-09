@@ -14,8 +14,8 @@ sample has to pass the gate's own test before it reaches actuation.
 > **Status: it gates over the bus, and actuates nothing.**
 > - It hears its candidates (`control_candidate`, `guidance_candidate`) and publishes
 >   `resolved_control` every cycle.
-> - Its own actuator still only logs. A downstream connector consuming `resolved_control` is its
->   own change.
+> - Its own actuator still only logs. A downstream connector consuming `resolved_control` is proposed
+>   in keelson#429 (`mavlink2keelson --resolved-control-gate`, opt-in) and not merged.
 > - Never run this against a real vessel or a shared network.
 
 ## What it does
