@@ -10,7 +10,7 @@ assignee when the manager is unhealthy), and it hears:
   cannot (an SDK without MaintenanceState, keelson#377) refuses to start rather than inhibit forever.
 
 It hears the candidates -- `control_candidate/**` (a station's helm) and `guidance_candidate/**` (the
-navigator, checked for DECISION and EXECUTION, I15) -- and the navigation authority document, and
+ANS, checked for DECISION and EXECUTION, I15) -- and the navigation authority document, and
 publishes `resolved_control/{vessel}` every cycle at --rate-hz: the rolling acknowledgement and the only
 thing downstream consumes. The actuator itself is still a LOGGING one (README).
 """

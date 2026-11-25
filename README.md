@@ -1,7 +1,7 @@
 # keelson-processor-control-gate
 
 The onboard **motion gate**, one per vessel: the enforcer between every candidate source (a station's
-helm, the navigator's `desired_*`) and the actuators. It owns the motion fence. It takes the authority
+helm, the ANS's `desired_*`) and the actuators. It owns the motion fence. It takes the authority
 manager's transfer as a PREPARE, reserves `(T, n+1)`, and changes authority only on the COMMIT. Every
 sample has to pass the gate's own test before it reaches actuation.
 
@@ -68,7 +68,7 @@ sample has to pass the gate's own test before it reaches actuation.
     alone records its cause with the fence it produced: an abort with the requester and the
     assignment they acted under, a CONN lapse with nobody. The cause is persisted, cleared by the next
     COMMIT, and exposed as `GateState.last_fence_cause` in the keelson builds that carry it. A manager
-    that was down reads it at reconcile and takes the navigator's functions back to that human.
+    that was down reads it at reconcile and takes the ANS's functions back to that human.
   - **Attested, by the gate itself** (crowsnest-dev#316; trust chain B, COMMAND-ARCHITECTURE §6).
     `requester_id` is a label. The ROC authority service's Ed25519-signed claim on
     `AbortAutomationRequest.attestation` (the manager's own `Attestation` type) is what names who
@@ -86,7 +86,7 @@ sample has to pass the gate's own test before it reaches actuation.
     - **Never silently closed.** A policy that requires attestation with no trusted key refuses to
       load, and the bin refuses to start on an SDK that cannot carry one. Either way the error says
       why.
-- **A guidance candidate is checked twice, independently (I15).** The navigator's
+- **A guidance candidate is checked twice, independently (I15).** The ANS's
   `GuidanceCandidate` must pass both:
   - **DECISION:** under NAV_FUNCTION, the source holds the named function in the navigation
     authority document, at method ≥ DELEGATED, under the document's current revision. Under
@@ -98,7 +98,7 @@ sample has to pass the gate's own test before it reaches actuation.
   - **EXECUTION:** under DIRECT, the source holds the conn itself; under CARRY_OUT, the named
     mapping is the DOF's and executes this source.
 
-  Then the per-DOF test runs. A navigator that holds `track_keeping` but not `collision_avoidance`
+  Then the per-DOF test runs. An ANS that holds `track_keeping` but not `collision_avoidance`
   cannot smuggle an avoidance through: EXECUTION passes and DECISION refuses.
 - **`resolved_control`, every cycle.** For each DOF it reports:
   - the requested and accepted values. The accepted value is **absent when the gate emits
@@ -185,7 +185,7 @@ sample has to pass the gate's own test before it reaches actuation.
 | hears `command_assignment/{vessel}` | its own projection, for the direct abort |
 | hears `safety_state/{vessel}` | ACTUATION_ALLOWED |
 | hears `maintenance_state/{vessel}` | ACTUATION_ALLOWED: INACTIVE and fresh, or every DOF INHIBITED |
-| hears `control_candidate/**` and `guidance_candidate/**` | the helm's and the navigator's proposals, per DOF |
+| hears `control_candidate/**` and `guidance_candidate/**` | the helm's and the ANS's proposals, per DOF |
 | hears `command_authority/{vessel}/navigation` | the navigation authority document, for DECISION |
 | hears `navigation_state/**` | each producer's human order in force, for HUMAN_ORDER, stamped on local receipt |
 | hears `command_authority/{vessel}/engineer` | a new ENGINEER token mints `plant_generation` |
@@ -222,7 +222,7 @@ uv pip install --python .venv/bin/python --no-deps -e ../keelson-processor-contr
 ```
 
 The joint tests (`tests/test_with_manager.py`, and the two-process e2e) are skipped when the manager
-is not installed. `tests/test_with_navigator.py` runs the navigator's own guidance candidates
+is not installed. `tests/test_with_navigator.py` runs the ANS's own guidance candidates
 through `on_guidance`, under NAV_FUNCTION, HUMAN_ORDER and DIRECT. It is skipped unless
 keelson-processor-navigation is installed the same way (`uv pip install --no-deps -e
 ../keelson-processor-navigation`).

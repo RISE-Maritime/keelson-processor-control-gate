@@ -231,7 +231,7 @@ class Stream:
 
 @dataclass(frozen=True)
 class Sample:
-    """One candidate sample: a station's axis, or the navigator's desired_* value. `recv_ms` is local
+    """One candidate sample: a station's axis, or the ANS's desired_* value. `recv_ms` is local
     receipt. `fence` is the caller's, when the candidate carries one."""
 
     source: str
@@ -255,7 +255,7 @@ class Sample:
 
 @dataclass(frozen=True)
 class Guidance:
-    """One GuidanceCandidate from the navigator: a Sample plus the two bases it claims.
+    """One GuidanceCandidate from the ANS: a Sample plus the two bases it claims.
 
     decision   "nav_function" (with `function` and `nav_revision`), "human_order" (with
                `order_id`), or "" for none
